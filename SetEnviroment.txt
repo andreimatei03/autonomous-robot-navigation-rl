@@ -1,8 +1,0 @@
-PowerShell
-
-deactivate
-Remove-Item -Recurse -Force rl_env
-python -m venv rl_env
-.\rl_env\Scripts\Activate
-
-Webots Tools Preferences - Python Command - C:\Users\HeXer36\Documents\Proiect Licenta\rl_env\Scripts\python.exe
