@@ -23,6 +23,15 @@ The goal is to enable the robot to learn optimal navigation strategies through i
 
 ---
 
+ Key Contributions
+
+- Designed a custom environment for robot navigation
+- Implemented a Deep Q-Network (DQN) from scratch
+- Developed reward strategy for obstacle avoidance
+- Structured the project into modular components (agent, environment, training)
+
+---
+
 ## Technologies Used
 
 - Python
