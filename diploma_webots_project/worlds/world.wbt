@@ -5,12 +5,27 @@ EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/project
 EXTERNPROTO "../protos/Pioneer3at.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/appearances/protos/CementTiles.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/appearances/protos/Asphalt.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/obstacles/protos/Ramp30deg.proto"
 
 WorldInfo {
+  contactProperties [
+    ContactProperties {
+      material1 "default"
+      material2 "default"
+      coulombFriction [
+        2
+      ]
+      forceDependentSlip [
+        0.001
+        0.001
+      ]
+      bounce 0
+    }
+  ]
 }
 Viewpoint {
-  orientation -0.15097789171185974 0.2594050613127872 0.9538944859781668 1.0116934990544617
-  position -21.351476671406793 -33.751820563522415 11.90826166791171
+  orientation -0.20808805990612841 0.31286176627471096 0.9267237315014502 1.185862705096145
+  position -25.9772339432229 -44.61313543401067 25.599990936966776
 }
 TexturedBackground {
 }
@@ -33,6 +48,14 @@ Solid {
   locked TRUE
 }
 Solid {
+  translation -4.82 -7.39 0
+  children [
+    Ramp30deg {
+    }
+  ]
+  name "Ramp"
+}
+Solid {
   translation 6 6 0.55
   children [
     Shape {
@@ -48,7 +71,7 @@ Solid {
   ]
   name "Block"
 }
-Solid {
+DEF OBSTACLE_CONE Solid {
   translation 7 -7 0.55
   children [
     Shape {
@@ -64,6 +87,29 @@ Solid {
     }
   ]
   name "Cone"
+  boundingObject Cylinder {
+    height 1
+    radius 0.5
+  }
+  locked TRUE
+}
+DEF GOAL_TARGET Solid {
+  translation 0 0 0.051
+  children [
+    Shape {
+      appearance Appearance {
+        material Material {
+          diffuseColor 1 0 0
+          emissiveColor 0.25 0 0
+        }
+      }
+      geometry Cylinder {
+        height 0.002
+        radius 1
+      }
+    }
+  ]
+  name "GoalTarget"
   locked TRUE
 }
 Solid {
@@ -78,6 +124,7 @@ Solid {
       }
     }
   ]
+  name "Cylinder"
 }
 Solid {
   translation 3 0 0.3
@@ -183,8 +230,21 @@ DEF Pioneer3AT Pioneer3at {
       locked TRUE
       horizontalResolution 720
       fieldOfView 3.14
-      numberOfLayers 1
+      verticalFieldOfView 0.35
+      numberOfLayers 4
       maxRange 10
+    }
+    InertialUnit {
+      name "imu"
+    }
+    GPS {
+      name "gps"
+    }
+    Gyro {
+      name "gyro"
+    }
+    Accelerometer {
+      name "accelerometer"
     }
   ]
 }
