@@ -56,7 +56,7 @@ class ScoutEnv:
         self.prev_distance = 0.0
         self.prev_nav_kind = "goal"
         self.step_count = 0
-        self.max_steps = 1200
+        self.max_steps = 1800
         self.simulation_running = True
         self.last_state = None
         self.done_reason = None
@@ -75,6 +75,13 @@ class ScoutEnv:
         self.max_traversable_slope_deg = 35.0
         self.max_safe_roll = 0.75
         self.max_safe_pitch = 0.75
+        self.path_clearance = 0.85
+        self.corner_clearance = 0.35
+        self.avoidance_reached_radius = 0.45
+        self.current_avoidance_target = None
+        self.completed_avoidance_targets = []
+        self.underpass_reached_radius = 0.55
+        self.current_underpass_stage = 0
         self.traversable_regions = [
             {
                 "type": "ramp",
@@ -107,6 +114,9 @@ class ScoutEnv:
 
         self.goal_x = safe_x
         self.goal_y = safe_y
+        self.current_avoidance_target = None
+        self.completed_avoidance_targets = []
+        self.current_underpass_stage = 0
         self.goal_on_traversable = self._point_in_traversable(self.goal_x, self.goal_y)
         self._move_goal_marker()
         nav_x, nav_y, nav_kind = self.get_navigation_target()
@@ -187,10 +197,59 @@ class ScoutEnv:
         side = 1.0 if self.y >= region["y"] else -1.0
         return access_x, region["y"] + side * (half_y + entry_margin)
 
+    def _underpass_target(self):
+        """Planifica trecerea pe sub rampa cand goal-ul este pe sol, dincolo de ea."""
+        if self.goal_on_traversable:
+            return None
+
+        for region in self.traversable_regions:
+            if region["type"] != "ramp":
+                continue
+            if not self._path_crosses_traversable():
+                continue
+
+            half_y = region["sy"] / 2.0
+            entry_margin = region.get("entry_margin", 0.55) + 0.25
+            goal_side = 1.0 if self.goal_y >= region["y"] else -1.0
+            robot_side = 1.0 if self.y >= region["y"] else -1.0
+
+            if goal_side == robot_side and not self._point_in_rect_region(region, self.x, self.y, margin=0.35):
+                continue
+
+            entry_side = -goal_side
+            entry = (region["x"], region["y"] + entry_side * (half_y + entry_margin))
+            exit_target = (region["x"], region["y"] + goal_side * (half_y + entry_margin))
+            aligned_with_underpass = abs(self.x - region["x"]) <= 0.9
+
+            if self.current_underpass_stage == 0:
+                entry_reached = self._target_distance(entry) <= self.underpass_reached_radius
+                crossed_entry_side = aligned_with_underpass and (self.y - region["y"]) * entry_side < half_y
+                if entry_reached or crossed_entry_side:
+                    self.current_underpass_stage = 1
+                else:
+                    return entry[0], entry[1], "underpass_entry"
+
+            if self.current_underpass_stage == 1:
+                exit_reached = self._target_distance(exit_target) <= self.underpass_reached_radius
+                crossed_exit_side = aligned_with_underpass and (self.y - region["y"]) * goal_side > half_y
+                if exit_reached or crossed_exit_side:
+                    self.current_underpass_stage = 2
+                    return None
+                return exit_target[0], exit_target[1], "underpass_exit"
+
+        return None
+
     def get_navigation_target(self):
-        """Returneaza targetul activ: goal final sau punct de acces la rampa."""
+        """Returneaza targetul activ: goal final, punct de acces sau waypoint de ocolire."""
         region = self._region_for_point(self.goal_x, self.goal_y)
         if region is None or region["type"] != "ramp":
+            underpass_target = self._underpass_target()
+            if underpass_target is not None:
+                return underpass_target
+
+            avoid_target = self._obstacle_avoidance_target()
+            if avoid_target is not None:
+                return avoid_target[0], avoid_target[1], "obstacle_avoid"
             return self.goal_x, self.goal_y, "goal"
 
         access_x, access_y = self._ramp_access_target(region)
@@ -205,6 +264,181 @@ class ScoutEnv:
             return access_x, access_y, "ramp_access"
 
         return self.goal_x, self.goal_y, "goal"
+
+    def _target_distance(self, target):
+        return math.sqrt((self.x - target[0]) ** 2 + (self.y - target[1]) ** 2)
+
+    def _rect_bounds(self, obstacle, margin=0.0):
+        half_x = obstacle["sx"] / 2.0 + margin
+        half_y = obstacle["sy"] / 2.0 + margin
+        return (
+            obstacle["x"] - half_x,
+            obstacle["x"] + half_x,
+            obstacle["y"] - half_y,
+            obstacle["y"] + half_y,
+        )
+
+    def _point_in_obstacle(self, obstacle, x, y, margin=0.0):
+        if obstacle["type"] == "rect":
+            min_x, max_x, min_y, max_y = self._rect_bounds(obstacle, margin)
+            return min_x <= x <= max_x and min_y <= y <= max_y
+
+        if obstacle["type"] == "circle":
+            return math.sqrt((x - obstacle["x"]) ** 2 + (y - obstacle["y"]) ** 2) <= obstacle["r"] + margin
+
+        return False
+
+    def _segment_intersects_rect(self, x1, y1, x2, y2, obstacle, margin=0.0):
+        min_x, max_x, min_y, max_y = self._rect_bounds(obstacle, margin)
+        dx = x2 - x1
+        dy = y2 - y1
+        t_min = 0.0
+        t_max = 1.0
+
+        for p, q in ((-dx, x1 - min_x), (dx, max_x - x1), (-dy, y1 - min_y), (dy, max_y - y1)):
+            if abs(p) < 1e-9:
+                if q < 0.0:
+                    return False
+                continue
+
+            t = q / p
+            if p < 0.0:
+                if t > t_max:
+                    return False
+                t_min = max(t_min, t)
+            else:
+                if t < t_min:
+                    return False
+                t_max = min(t_max, t)
+
+        return t_max > 0.02 and t_min < 0.98
+
+    def _segment_intersects_circle(self, x1, y1, x2, y2, obstacle, margin=0.0):
+        radius = obstacle["r"] + margin
+        dx = x2 - x1
+        dy = y2 - y1
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 1e-9:
+            return self._point_in_obstacle(obstacle, x1, y1, margin)
+
+        t = ((obstacle["x"] - x1) * dx + (obstacle["y"] - y1) * dy) / length_sq
+        t = max(0.0, min(1.0, t))
+        closest_x = x1 + t * dx
+        closest_y = y1 + t * dy
+        return math.sqrt((closest_x - obstacle["x"]) ** 2 + (closest_y - obstacle["y"]) ** 2) <= radius
+
+    def _segment_intersects_obstacle(self, x1, y1, x2, y2, obstacle, margin=0.0):
+        if obstacle["type"] == "rect":
+            return self._segment_intersects_rect(x1, y1, x2, y2, obstacle, margin)
+        if obstacle["type"] == "circle":
+            return self._segment_intersects_circle(x1, y1, x2, y2, obstacle, margin)
+        return False
+
+    def _first_blocking_obstacle(self, x1, y1, x2, y2, margin=None, ignore=None):
+        margin = self.path_clearance if margin is None else margin
+        closest_obstacle = None
+        closest_distance = float("inf")
+
+        for obstacle in self.current_map_obstacles:
+            if ignore is obstacle:
+                continue
+            if not self._segment_intersects_obstacle(x1, y1, x2, y2, obstacle, margin):
+                continue
+
+            distance = math.sqrt((obstacle["x"] - x1) ** 2 + (obstacle["y"] - y1) ** 2)
+            if distance < closest_distance:
+                closest_distance = distance
+                closest_obstacle = obstacle
+
+        return closest_obstacle
+
+    def _waypoint_is_clear(self, wx, wy, blocking_obstacle):
+        if abs(wx) > self.arena_limit - 0.4 or abs(wy) > self.arena_limit - 0.4:
+            return False
+
+        for done_x, done_y in self.completed_avoidance_targets:
+            if math.sqrt((wx - done_x) ** 2 + (wy - done_y) ** 2) < self.avoidance_reached_radius:
+                return False
+
+        for obstacle in self.current_map_obstacles:
+            if self._point_in_obstacle(obstacle, wx, wy, self.path_clearance * 0.7):
+                return False
+
+        start_blocked = self._first_blocking_obstacle(
+            self.x, self.y, wx, wy,
+            margin=0.15,
+        )
+        goal_blocked = self._first_blocking_obstacle(
+            wx, wy, self.goal_x, self.goal_y,
+            margin=0.15,
+        )
+        return start_blocked is None and goal_blocked is None
+
+    def _rect_avoidance_candidates(self, obstacle):
+        min_x, max_x, min_y, max_y = self._rect_bounds(
+            obstacle,
+            self.path_clearance + self.corner_clearance,
+        )
+        return [
+            (min_x, min_y),
+            (min_x, max_y),
+            (max_x, min_y),
+            (max_x, max_y),
+        ]
+
+    def _circle_avoidance_candidates(self, obstacle):
+        radius = obstacle["r"] + self.path_clearance + self.corner_clearance
+        return [
+            (obstacle["x"] + radius, obstacle["y"]),
+            (obstacle["x"] - radius, obstacle["y"]),
+            (obstacle["x"], obstacle["y"] + radius),
+            (obstacle["x"], obstacle["y"] - radius),
+        ]
+
+    def _obstacle_avoidance_target(self):
+        if self.current_avoidance_target is not None:
+            if self._first_blocking_obstacle(
+                    self.x, self.y, self.goal_x, self.goal_y,
+                    margin=self.path_clearance) is None:
+                self.current_avoidance_target = None
+                return None
+
+            if self._target_distance(self.current_avoidance_target) <= self.avoidance_reached_radius:
+                self.completed_avoidance_targets.append(self.current_avoidance_target)
+                self.current_avoidance_target = None
+            else:
+                return self.current_avoidance_target
+
+        blocking_obstacle = self._first_blocking_obstacle(
+            self.x, self.y, self.goal_x, self.goal_y,
+            margin=self.path_clearance,
+        )
+        if blocking_obstacle is None:
+            return None
+
+        if blocking_obstacle["type"] == "rect":
+            candidates = self._rect_avoidance_candidates(blocking_obstacle)
+        elif blocking_obstacle["type"] == "circle":
+            candidates = self._circle_avoidance_candidates(blocking_obstacle)
+        else:
+            return None
+
+        best = None
+        best_score = float("inf")
+        for wx, wy in candidates:
+            if not self._waypoint_is_clear(wx, wy, blocking_obstacle):
+                continue
+
+            score = (
+                math.sqrt((wx - self.x) ** 2 + (wy - self.y) ** 2) +
+                math.sqrt((self.goal_x - wx) ** 2 + (self.goal_y - wy) ** 2)
+            )
+            if score < best_score:
+                best_score = score
+                best = (wx, wy)
+
+        self.current_avoidance_target = best
+        return best
 
     def get_navigation_error(self):
         nav_x, nav_y, nav_kind = self.get_navigation_target()
@@ -256,15 +490,14 @@ class ScoutEnv:
             return False
 
         region = self._region_for_point(self.goal_x, self.goal_y)
-        if region is None and not self._path_crosses_traversable():
+        if region is None:
             return False
 
-        if region is not None:
-            access_x, access_y = self._ramp_access_target(region)
-            near_access = math.sqrt((self.x - access_x) ** 2 + (self.y - access_y) ** 2) < self.ramp_commit_distance
-            on_valid_lane = self._point_in_ramp_lane(region, self.x, self.y, margin=0.35)
-            if not (near_access or on_valid_lane):
-                return False
+        access_x, access_y = self._ramp_access_target(region)
+        near_access = math.sqrt((self.x - access_x) ** 2 + (self.y - access_y) ** 2) < self.ramp_commit_distance
+        on_valid_lane = self._point_in_ramp_lane(region, self.x, self.y, margin=0.35)
+        if not (near_access or on_valid_lane):
+            return False
 
         dx = nav_x - self.x
         dy = nav_y - self.y
@@ -284,7 +517,10 @@ class ScoutEnv:
         if abs(self.roll) > self.max_safe_roll or abs(self.pitch) > self.max_safe_pitch:
             return False
 
-        nav_distance, nav_angle, _ = self.get_navigation_error()
+        nav_distance, nav_angle, nav_kind = self.get_navigation_error()
+        if not self.goal_on_traversable or nav_kind not in ("goal", "ramp_access"):
+            return False
+
         if nav_distance > 8.0 or abs(nav_angle) > 0.55:
             return False
 
@@ -371,15 +607,7 @@ class ScoutEnv:
         if self.robot.step(self.timestep) == -1:
             self.simulation_running = False
 
-        self.x = start_x
-        self.y = start_y
-        self.z = 0.05
-        self.theta = start_theta
-        self.roll = 0.0
-        self.pitch = 0.0
-        self.yaw = start_theta
-        self.gyro_rate = [0.0, 0.0, 0.0]
-        self.acceleration = [0.0, 0.0, 0.0]
+        self._update_odometry()
 
         self.v = 0.0
         self.w = 0.0
@@ -387,6 +615,9 @@ class ScoutEnv:
         self.w_prev = 0.0
         self.step_count = 0
         self.done_reason = None
+        self.current_avoidance_target = None
+        self.completed_avoidance_targets = []
+        self.current_underpass_stage = 0
 
         if random_goal:
             # Goal random, garantat diferit de start și în arenă
@@ -441,13 +672,16 @@ class ScoutEnv:
     # ------------------------------------------------------------------
 
     def _apply_action(self, action):
+        # -1 - reverse scurt (folosit doar de controllerul simplu pentru recuperare)
         # 0 - forward
         # 1 - forward-left
         # 2 - forward-right
         # 3 - rotate left
         # 4 - rotate right
 
-        if action == 0:
+        if action == -1:
+            v_target, w_target = -0.25,  0.0
+        elif action == 0:
             v_target, w_target = 0.55,  0.0
         elif action == 1:
             v_target, w_target = 0.45,  1.0
@@ -510,7 +744,7 @@ class ScoutEnv:
     # ------------------------------------------------------------------
 
     def _safe_range(self, ranges, idx, max_range):
-        if not ranges:
+        if ranges is None or len(ranges) == 0:
             return max_range
         idx = max(0, min(idx, len(ranges) - 1))
         value = ranges[idx]
@@ -525,6 +759,10 @@ class ScoutEnv:
         except AttributeError:
             horizontal_resolution = len(ranges)
             layers = 1
+
+        if horizontal_resolution > 0 and len(ranges) >= horizontal_resolution:
+            detected_layers = max(1, len(ranges) // horizontal_resolution)
+            layers = min(max(1, layers), detected_layers)
 
         if layers <= 1 or horizontal_resolution <= 0:
             return self._safe_range(ranges, horizontal_index, max_range)
@@ -544,6 +782,10 @@ class ScoutEnv:
         except AttributeError:
             horizontal_resolution = len(ranges)
             layers = 1
+
+        if horizontal_resolution > 0 and len(ranges) >= horizontal_resolution:
+            detected_layers = max(1, len(ranges) // horizontal_resolution)
+            layers = min(max(1, layers), detected_layers)
 
         n = max(1, horizontal_resolution)
         lower_layer = max(0, layers - 1)

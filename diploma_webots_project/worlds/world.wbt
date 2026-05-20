@@ -10,22 +10,19 @@ EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/project
 WorldInfo {
   contactProperties [
     ContactProperties {
-      material1 "default"
-      material2 "default"
       coulombFriction [
         2
       ]
-      forceDependentSlip [
-        0.001
-        0.001
-      ]
       bounce 0
+      forceDependentSlip [
+        0.001, 0.001
+      ]
     }
   ]
 }
 Viewpoint {
   orientation -0.20808805990612841 0.31286176627471096 0.9267237315014502 1.185862705096145
-  position -25.9772339432229 -44.61313543401067 25.599990936966776
+  position -23.637749075892657 -46.66535630793077 23.802947531537626
 }
 TexturedBackground {
 }
@@ -70,6 +67,10 @@ Solid {
     }
   ]
   name "Block"
+  boundingObject Box {
+    size 3 1.5 1
+  }
+  locked TRUE
 }
 DEF OBSTACLE_CONE Solid {
   translation 7 -7 0.55
@@ -105,7 +106,6 @@ DEF GOAL_TARGET Solid {
       }
       geometry Cylinder {
         height 0.002
-        radius 1
       }
     }
   ]
@@ -125,6 +125,11 @@ Solid {
     }
   ]
   name "Cylinder"
+  boundingObject Cylinder {
+    height 1
+    radius 0.5
+  }
+  locked TRUE
 }
 Solid {
   translation 3 0 0.3
@@ -138,6 +143,9 @@ Solid {
     }
   ]
   name "Cube1"
+  boundingObject Box {
+    size 0.5 0.5 0.5
+  }
   locked TRUE
 }
 Solid {
@@ -231,20 +239,16 @@ DEF Pioneer3AT Pioneer3at {
       horizontalResolution 720
       fieldOfView 3.14
       verticalFieldOfView 0.35
-      numberOfLayers 4
       maxRange 10
     }
     InertialUnit {
       name "imu"
     }
     GPS {
-      name "gps"
     }
     Gyro {
-      name "gyro"
     }
     Accelerometer {
-      name "accelerometer"
     }
   ]
 }

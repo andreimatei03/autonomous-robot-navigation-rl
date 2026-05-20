@@ -16,7 +16,7 @@ from scout_env import ScoutEnv
 # ======================================================
 
 NUM_EPISODES   = 1000
-MAX_STEPS      = 1200
+MAX_STEPS      = 1800
 EVAL_EPISODES  = 5       # episoade de eval după training
 GOAL_KEY       = 'g'     # tasta pentru schimbat goal în eval
 
@@ -110,18 +110,57 @@ def print_episode_result(prefix):
         )
 
 
+_sanity_last_pos = None
+_sanity_stuck_steps = 0
+_sanity_recovery_steps = 0
+_sanity_recovery_turn = 3
+
+
+def reset_sanity_controller_memory():
+    global _sanity_last_pos, _sanity_stuck_steps, _sanity_recovery_steps, _sanity_recovery_turn
+    _sanity_last_pos = None
+    _sanity_stuck_steps = 0
+    _sanity_recovery_steps = 0
+    _sanity_recovery_turn = 3
+
+
 def select_sanity_action(state):
+    global _sanity_last_pos, _sanity_stuck_steps, _sanity_recovery_steps, _sanity_recovery_turn
+
     front, left, right, front_left, front_right, upper_front, mid_front, \
         height_profile, distance, angle, v, w, z, roll, pitch, yaw_rate = state
     nav_distance, nav_angle, nav_kind = env.get_navigation_error()
+    final_distance = math.sqrt((env.goal_x - env.x) ** 2 + (env.goal_y - env.y) ** 2)
 
     close_to_goal = nav_distance < 0.03
+    near_final_goal = nav_kind == "goal" and final_distance < 2.8
     drive_over_traversable = (
         env.should_drive_over_traversable() or
         env.can_attempt_traversable_ahead(state) or
         env.is_on_traversable_terrain()
     )
     unstable_attitude = abs(env.roll) > env.max_safe_roll or abs(env.pitch) > env.max_safe_pitch
+
+    current_pos = (env.x, env.y)
+    if _sanity_last_pos is None:
+        _sanity_last_pos = current_pos
+    moved = math.sqrt((current_pos[0] - _sanity_last_pos[0]) ** 2 + (current_pos[1] - _sanity_last_pos[1]) ** 2)
+    _sanity_last_pos = current_pos
+
+    if final_distance > env.goal_tolerance and abs(nav_angle) < 0.75 and moved < 0.002:
+        _sanity_stuck_steps += 1
+    else:
+        _sanity_stuck_steps = max(0, _sanity_stuck_steps - 2)
+
+    if _sanity_recovery_steps > 0:
+        _sanity_recovery_steps -= 1
+        return -1 if _sanity_recovery_steps > 18 else _sanity_recovery_turn
+
+    if _sanity_stuck_steps > 45:
+        _sanity_stuck_steps = 0
+        _sanity_recovery_steps = 34
+        _sanity_recovery_turn = 3 if left > right else 4
+        return -1
 
     if unstable_attitude:
         return 0 if nav_distance > 0.5 and abs(nav_angle) < 0.35 else (3 if nav_angle > 0 else 4)
@@ -148,19 +187,24 @@ def select_sanity_action(state):
             return 2
         return 0
 
+    front_limit = 0.06 if near_final_goal else 0.14
+    diagonal_limit = 0.05 if near_final_goal else 0.10
     if not close_to_goal and not drive_over_traversable and (
-            front < 0.14 or front_left < 0.10 or front_right < 0.10):
+            front < front_limit or front_left < diagonal_limit or front_right < diagonal_limit):
         return 3 if left > right else 4
     if close_to_goal and front < 0.04:
         return 3 if left > right else 4
 
-    if nav_angle > 0.45:
+    rotate_limit = 0.60 if near_final_goal else 0.45
+    steer_limit = 0.18 if near_final_goal else 0.10
+
+    if nav_angle > rotate_limit:
         return 3
-    if nav_angle < -0.45:
+    if nav_angle < -rotate_limit:
         return 4
-    if nav_angle > 0.10:
+    if nav_angle > steer_limit:
         return 1
-    if nav_angle < -0.10:
+    if nav_angle < -steer_limit:
         return 2
     return 0
 
@@ -432,16 +476,18 @@ def run_sanity_check():
     sx, sy, stheta, gx, gy = config[0]
     env.set_goal(gx, gy)
     state = env.reset(start_x=sx, start_y=sy, start_theta=stheta, random_goal=False)
+    reset_sanity_controller_memory()
 
     print(f"  Start: ({sx:.2f}, {sy:.2f}, theta={stheta:.2f} rad)")
     print(f"  Goal:  ({env.goal_x:.2f}, {env.goal_y:.2f})")
 
-    last_nav_kind = None
+    last_nav_signature = None
     while env.simulation_running:
         nav_x, nav_y, nav_kind = env.get_navigation_target()
-        if nav_kind != last_nav_kind:
+        nav_signature = (nav_kind, round(nav_x, 2), round(nav_y, 2))
+        if nav_signature != last_nav_signature:
             print(f"[NAV] Target activ: {nav_kind} ({nav_x:.2f}, {nav_y:.2f})")
-            last_nav_kind = nav_kind
+            last_nav_signature = nav_signature
 
         action = select_sanity_action(state)
         state, reward, done = env.step(action)
