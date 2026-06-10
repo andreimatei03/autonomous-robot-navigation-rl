@@ -1,6 +1,199 @@
 import math
 import random
 
+import numpy as np
+
+
+# ----------------------------------------------------------------------
+# Tabel rază de gabarit (m) pe tip de PROTO / DEF, folosit DOAR pentru
+# plasarea sigură a goal-ului (nu intervine în percepția RL, care e LiDAR).
+# Citirea dinamică din Webots completează automat lista de obstacole.
+# ----------------------------------------------------------------------
+PROTO_RADIUS = {
+    # Vegetație de interior (Pine e rezervat pădurii de graniță → NU se înregistrează)
+    "SimpleTree": 0.8, "Oak": 1.1, "Cypress": 0.7,
+    # Vehicule
+    "ToyotaPrius": 2.4, "CitroenCZero": 1.8, "BmwX5": 2.6,
+    "MercedesBenzSprinter": 3.2, "TeslaModel3": 2.4, "RangeRoverSportSVR": 2.6,
+    # Clădiri (raze de gabarit reale → evită suprapunerile)
+    "SimpleTwoFloorsHouse": 7.0, "ModernHouse": 11.0, "HouseWithGarage": 9.0,
+    "BungalowStyleHouse": 12.0, "Barn": 9.0, "Warehouse": 14.0, "GasStation": 11.0,
+    # Structuri/decor adăugate manual în world.wbt (altfel goal-ul cădea în ele)
+    "Windmill": 3.5, "Swing": 2.5, "DogHouse": 0.9, "IntermodalContainer": 3.5,
+    # Mobilier urban / trafic
+    "StreetLight": 0.4, "FireHydrant": 0.4, "TrafficCone": 0.3,
+    # Containere / industrie
+    "OilBarrel": 0.5, "CardboardBox": 0.5, "WoodenBox": 0.6,
+    "WoodenPalletStack": 1.0,
+    # Props naturale / animale (un-DEF'd → altfel invizibile la plasarea goal-ului)
+    "Rock": 1.0, "Dog": 0.6,
+    # Oameni
+    "Pedestrian": 0.5,
+}
+DEFAULT_OBSTACLE_RADIUS = 0.6
+
+# Rază pe DEF exact pentru obstacole Solid personalizate.
+DEF_RADIUS = {
+    "OBS_PARTIALWALL1": 2.1, "OBS_PARTIALWALL2": 1.6,
+}
+
+# Rază pe PREFIX de DEF, pentru obstacole generate auto-numerotate
+# (OBS_ROCK0, OBS_TREE3, OBS_CONTAINER1, OBS_BARREL2, ...).
+DEF_PREFIX_RADIUS = {
+    "OBS_ROCK": 1.2, "OBS_TREE": 0.9, "OBS_BUSH": 0.6,
+    "OBS_CONTAINER": 2.0, "OBS_PIPE": 1.3, "OBS_BARREL": 0.5,
+    "OBS_CRATE": 0.7, "OBS_LOG": 2.2,
+    # Zone inaccesibile (clustere impenetrabile)
+    "OBS_BOULDER": 1.0, "OBS_THKT": 0.9, "OBS_RUBBLE": 0.7,
+    # Ruină-landmark (ziduri de piatră) — adăugată direct în world.wbt
+    "OBS_RUIN": 2.0,
+    # Platforma/peronul casei (slab pavat ridicat, robotul nu urcă pe el) →
+    # exclude goal-ul de pe toată dala (raza acoperă semidiagonala de ~12.4 m).
+    "OBS_HOUSEPAD": 12.5,
+}
+
+# Nodurile care NU sunt obstacole (nu blochează plasarea goal-ului).
+# Pinii fără DEF formează pădurea de graniță și sunt ignorați automat:
+# tipul "Pine" nu e în PROTO_RADIUS → raza rămâne None → sărit.
+NON_OBSTACLE_DEFS = {"Pioneer3AT", "GOAL_TARGET", "TERRAIN"}
+
+# Numărul de sectoare LiDAR din starea RL (min-pooling uniform pe FOV-ul
+# orizontal de 180°; 12 × 15°). Folosit și de baseline-ul din rl_scout.py.
+N_LIDAR_SECTORS = 12
+NON_OBSTACLE_TYPES = {
+    "TexturedBackground", "TexturedBackgroundLight", "Viewpoint",
+    "WorldInfo", "Robot", "Pioneer3at", "DirectionalLight", "PointLight",
+    "SpotLight", "Fog", "UnevenTerrain", "Floor",
+}
+
+
+# ----------------------------------------------------------------------
+# Modelul terenului neregulat — SURSĂ UNICĂ DE ADEVĂR.
+# Aceleași funcții sunt importate de generate_world.py (care emite
+# ElevationGrid-ul din world.wbt) și folosite aici pentru poziționarea
+# robotului/goal-ului și validarea pantei → înălțimile pe care le „știe"
+# Python sunt EXACT cele randate / cu coliziune din simulare.
+# Harta: TEREN NEREGULAT pe toată suprafața (dealuri line, pitch/roll real),
+# cu o zonă plată în centru pentru spawn. FĂRĂ rim/bazin/munți — marginea
+# navigabilă e închisă de o PĂDURE DEASĂ de pini (vezi generate_world.py).
+# ----------------------------------------------------------------------
+MAP_SIZE = 150.0
+HALF = MAP_SIZE / 2.0
+GRID_DIM = 76
+GRID_SPACING = MAP_SIZE / (GRID_DIM - 1)
+
+R_START_FLAT = 10.0    # raza zonei plate de spawn (stabilitate la reset)
+
+# ----------------------------------------------------------------------
+# Contur navigabil NEREGULAT (poiană organică, NU cerc).
+# Raza marginii navigabile variază lin cu unghiul (sumă de armonici joase)
+# → o poiană cu formă organică. Pădurea de graniță (generate_world.border_ring)
+# urmează EXACT acest contur, iar in_navigable / out_of_bounds / plasarea
+# goal-ului îl folosesc → o singură sursă de adevăr pentru forma hărții.
+# ----------------------------------------------------------------------
+BOUNDARY_R0 = 50.0     # raza medie a poienii
+BOUNDARY_AMP = 5.0     # cât de neregulat e conturul (rază în ~[R0-AMP, R0+AMP])
+# Raza MAXIMĂ a poienii — păstrată pentru curriculum-ul din rl_scout și pentru
+# intervalul de eșantionare al goal-ului (numele istoric "arena_limit").
+ARENA_LIMIT = BOUNDARY_R0 + BOUNDARY_AMP
+
+
+def boundary_r(angle):
+    """Raza conturului navigabil la unghiul dat — formă organică netedă și
+    deterministă (armonici de ordin mic). Min ≈ R0-AMP, max ≈ R0+AMP.
+    Importată de generate_world.py: pădurea de graniță și fundalul de pini
+    se plasează pe ACEASTĂ curbă → pădurea urmează forma suprafeței, nu un cerc."""
+    return BOUNDARY_R0 + BOUNDARY_AMP * (
+        0.60 * math.sin(3.0 * angle + 0.7) +
+        0.25 * math.sin(5.0 * angle + 2.1) +
+        0.15 * math.cos(2.0 * angle - 1.0))
+
+
+HILL_AMP = 1.5         # amplitudinea dealurilor (teren neregulat, traversabil)
+
+# ----------------------------------------------------------------------
+# Platforme plate (graded pads) sub clădirile-landmark.
+# Pe terenul neregulat, clădirile mari (amprentă mare) ar pluti/s-ar îngropa,
+# fiindcă înălțimea variază pe sub amprenta lor. Soluție realistă (ca pe un
+# șantier): nivelăm o platformă plată sub fiecare clădire. Pozițiile sunt
+# DETERMINISTE și partajate cu generate_world.py (aceeași sursă de adevăr),
+# de-aliniate (nu un inel regulat) → aspect nestructurat.
+#   (proto, x, y, footprint_r, yaw_idx, defname)
+# ----------------------------------------------------------------------
+BUILDINGS = [
+    ("Warehouse",  26.0, -10.0, 12.0, 3, "bld_warehouse"),
+    ("Barn",      -24.0,  18.0,  7.5, 0, "bld_barn"),
+]
+PAD_FLAT_MARGIN = 1.5  # platforma e plată până la footprint_r + această margine
+PAD_BLEND = 4.0        # lățimea inelului de racordare lină la terenul natural
+_PADS = [(bx, by, fp) for (_p, bx, by, fp, _yi, _dn) in BUILDINGS]
+
+
+def _hills(x, y):
+    """Dealuri line din sumă de sinusoide multi-frecvență (determinist).
+    Pante sub ~10° peste tot → teren neregulat, dar traversabil de Pioneer."""
+    return (0.55 * math.sin(0.075 * x) * math.cos(0.065 * y) +
+            0.30 * math.sin(0.130 * x + 1.3) * math.sin(0.110 * y) +
+            0.20 * math.cos(0.170 * y + 0.5) +
+            0.15 * math.sin(0.210 * x + 0.7) * math.cos(0.090 * y))
+
+
+def _base_height(x, y):
+    """Înălțimea dealurilor (fără platforme), plat în centru pentru spawn."""
+    r = math.hypot(x, y)
+    flat = max(0.0, min(1.0, (r - 4.0) / (R_START_FLAT - 4.0)))
+    return _hills(x, y) * HILL_AMP * flat
+
+
+def terrain_height(x, y):
+    """Teren neregulat pe TOATĂ harta (dealuri line) + platforme plate sub
+    clădiri. FĂRĂ rim/bazin/munți: marginea hărții e închisă de pădurea deasă,
+    nu de munți → înălțimile rămân mici și traversabile. Platformele sunt
+    plate în interior și se racordează lin (smoothstep) la dealuri la margine
+    → clădirile stau flush, fără să plutească sau să se îngroape."""
+    h = _base_height(x, y)
+    for (px, py, fp) in _PADS:
+        flat_r = fp + PAD_FLAT_MARGIN
+        out_r = flat_r + PAD_BLEND
+        d = math.hypot(x - px, y - py)
+        if d < out_r:
+            pad_z = _base_height(px, py)
+            if d <= flat_r:
+                s = 0.0
+            else:
+                t = (d - flat_r) / PAD_BLEND
+                s = t * t * (3.0 - 2.0 * t)   # smoothstep 0→1
+            h = pad_z * (1.0 - s) + h * s
+    return h
+
+
+def terrain_slope(x, y, d=0.6):
+    """Magnitudinea gradientului local (diferențe finite)."""
+    hx = (terrain_height(x + d, y) - terrain_height(x - d, y)) / (2.0 * d)
+    hy = (terrain_height(x, y + d) - terrain_height(x, y - d)) / (2.0 * d)
+    return math.hypot(hx, hy)
+
+
+def in_navigable(x, y, margin=1.0):
+    """True dacă (x, y) e în interiorul poienii navigabile (contur NEREGULAT
+    boundary_r), la fel ca pădurea de graniță și terminarea out_of_bounds →
+    fără ținte în pădure, indiferent de forma organică a marginii."""
+    return math.hypot(x, y) < (boundary_r(math.atan2(y, x)) - margin)
+
+
+def heightfield_grid():
+    """Array-ul height[] pentru ElevationGrid în ordinea Webots:
+    height[i + j*xDimension], i = index x (bucla interioară), j = index y
+    (bucla exterioară). Terenul (Solid) e translatat cu (-HALF, -HALF, 0)
+    → grila se centrează pe origine."""
+    heights = []
+    for j in range(GRID_DIM):
+        y = j * GRID_SPACING - HALF
+        for i in range(GRID_DIM):
+            x = i * GRID_SPACING - HALF
+            heights.append(terrain_height(x, y))
+    return heights
+
 
 class ScoutEnv:
 
@@ -49,62 +242,230 @@ class ScoutEnv:
         self.gyro_rate = [0.0, 0.0, 0.0]
         self.acceleration = [0.0, 0.0, 0.0]
 
-        # Goal (setat extern sau random)
+        # Goal
         self.goal_x = 0.0
         self.goal_y = 0.0
 
         self.prev_distance = 0.0
-        self.prev_nav_kind = "goal"
         self.step_count = 0
-        self.max_steps = 1800
+        self.max_steps = 5000
         self.simulation_running = True
         self.last_state = None
         self.done_reason = None
 
-        self.state_dim = 16
+        self.state_dim = N_LIDAR_SECTORS + 11   # 12 sectoare + 3 profil vertical + 8 navigație/IMU
         self.action_dim = 5
 
-        # Limita arenei (pereții sunt la ±14m, marginea de siguranță)
-        self.arena_limit = 12.0
+        # Goal-urile se plasează în poiană (boundary_r). Robotul, în schimb, e
+        # mărginit de PĂDUREA tot mai deasă spre marginea hărții, impenetrabilă
+        # la margine → terminarea out_of_bounds e doar plasa de siguranță la
+        # marginea pătratului (±HALF), ca robotul să nu cadă de pe hartă.
+        self.arena_limit = ARENA_LIMIT       # raza MAXIMĂ a poienii (curriculum/eșantionare)
+        self.bounds_margin = 1.5             # față de marginea pătratului (HALF)
         self.goal_clearance = 1.5
-        self.goal_marker_z = 0.051
-        self.goal_tolerance = 0.2
-        self.goal_on_traversable = False
-        self.ramp_access_reached_radius = 0.85
-        self.ramp_commit_distance = 1.05
-        self.max_traversable_slope_deg = 35.0
+        # Nodul GOAL_TARGET stă la nivelul solului; orbul-beacon plutește prin
+        # offset-ul local al copiilor → înălțime constantă față de teren, fără
+        # clipping pe pante (vezi geometria din generate_world.goal_block).
+        self.goal_marker_z = 0.0
+        self.goal_tolerance = 0.45
+        self.max_goal_slope = 0.30
+
+        # Praguri de stabilitate pe teren denivelat (IMU) — răsturnare la graniță
         self.max_safe_roll = 0.75
         self.max_safe_pitch = 0.75
-        self.path_clearance = 0.85
-        self.corner_clearance = 0.35
-        self.avoidance_reached_radius = 0.45
-        self.current_avoidance_target = None
-        self.completed_avoidance_targets = []
-        self.underpass_reached_radius = 0.55
-        self.current_underpass_stage = 0
-        self.traversable_regions = [
-            {
-                "type": "ramp",
-                "name": "Ramp",
-                "x": -4.82,
-                "y": -7.39,
-                "sx": 5.2,
-                "sy": 2.4,
-                "height": 0.55,
-                "top_fraction": 0.45,
-                "slope_deg": 30.0,
-                "entry_margin": 0.65,
-                "side_margin": 0.45,
-            },
-        ]
-        self.current_map_obstacles = [
-            {"type": "rect", "name": "Block", "x": 6.0, "y": 6.0, "sx": 3.0, "sy": 1.5},
-            {"type": "rect", "name": "Cube1", "x": 3.0, "y": 0.0, "sx": 0.5, "sy": 0.5},
-            {"type": "circle", "name": "Cylinder", "x": -6.0, "y": 8.0, "r": 0.5},
-            {"type": "circle", "name": "Cone", "x": 7.0, "y": -7.0, "r": 0.5},
-        ]
+
+        # Plasare start random (când e cerută): clearance mai mare decât la goal,
+        # fiindcă robotul are gabarit fizic (nu e un punct).
+        self.start_clearance = 1.4
+
+        # Anti-blocaj: dacă robotul nu se deplasează mai mult de stuck_move_thresh
+        # (m) în ultimii stuck_patience pași → e înțepenit/oscilează pe loc, iar
+        # episodul se încheie cu „stuck" (taie episoadele care altfel mergeau
+        # până la timeout). Ocolirile reale mișcă robotul > prag → nu sunt afectate.
+        self.stuck_patience = 600
+        self.stuck_move_thresh = 0.5
+        self._stuck_anchor_x = 0.0
+        self._stuck_anchor_y = 0.0
+        self._stuck_anchor_step = 0
+
+        # Obstacole citite dinamic din scenă (doar pentru plasarea goal-ului)
+        self.current_map_obstacles = []
+        self.terrain_enabled = True
 
     # ------------------------------------------------------------------
+    # Transformarea coordonatelor (lume → cadrul robotului)
+    # ------------------------------------------------------------------
+    def world_to_robot_frame(self, wx, wy):
+        """Distanța și unghiul punctului (wx, wy) în cadrul robotului.
+        Echivalent cu o transformare omogenă 2D lume→robot urmată de
+        conversia în coordonate polare (folosit pentru starea RL)."""
+        dx = wx - self.x
+        dy = wy - self.y
+        distance = math.hypot(dx, dy)
+        angle = math.atan2(dy, dx) - self.theta
+        angle = math.atan2(math.sin(angle), math.cos(angle))
+        return distance, angle
+
+    def get_navigation_error(self):
+        """Distanța și unghiul spre goal (folosit de baseline-ul reactiv)."""
+        distance, angle = self.world_to_robot_frame(self.goal_x, self.goal_y)
+        return distance, angle, "goal"
+
+    # ------------------------------------------------------------------
+    # Citirea dinamică a mediului din arborele scenei (Supervisor)
+    # ------------------------------------------------------------------
+    def scan_world_obstacles(self):
+        """Parcurge nodurile de nivel înalt și extrage (x, y, r) pentru
+        fiecare obstacol. Apelat la fiecare reset → Python rămâne mereu
+        sincron cu world.wbt, indiferent ce obiecte adăugăm."""
+        obstacles = []
+        try:
+            root = self.robot.getRoot()
+            children = root.getField("children")
+            count = children.getCount()
+        except Exception:
+            self.current_map_obstacles = obstacles
+            return obstacles
+
+        for i in range(count):
+            try:
+                node = children.getMFNode(i)
+            except Exception:
+                continue
+            if node is None:
+                continue
+
+            type_name = node.getTypeName() or ""
+            def_name = node.getDef() or ""
+
+            if def_name in NON_OBSTACLE_DEFS or type_name in NON_OBSTACLE_TYPES:
+                continue
+            if def_name.startswith(("FLOOR", "Floor", "WALL", "Wall")):
+                continue
+
+            t_field = node.getField("translation")
+            if t_field is None:
+                continue
+            try:
+                pos = t_field.getSFVec3f()
+            except Exception:
+                continue
+
+            radius = None
+            if def_name.startswith("OBS_"):
+                radius = DEF_RADIUS.get(def_name)
+                if radius is None:
+                    for prefix, pref_r in DEF_PREFIX_RADIUS.items():
+                        if def_name.startswith(prefix):
+                            radius = pref_r
+                            break
+                if radius is None:
+                    radius = PROTO_RADIUS.get(type_name, DEFAULT_OBSTACLE_RADIUS)
+            elif type_name in PROTO_RADIUS:
+                radius = PROTO_RADIUS[type_name]
+            if radius is None:
+                continue
+
+            obstacles.append({"x": pos[0], "y": pos[1], "r": radius})
+
+        self.current_map_obstacles = obstacles
+        return obstacles
+
+    # ------------------------------------------------------------------
+    # Înălțimea terenului (pentru marker goal / z de start)
+    # ------------------------------------------------------------------
+    def _surface_z_at(self, x, y):
+        if not self.terrain_enabled:
+            return 0.0
+        return terrain_height(x, y)
+
+    # ------------------------------------------------------------------
+    # Goal
+    # ------------------------------------------------------------------
+    def _clamp_to_arena(self, x, y):
+        """Aduce (x, y) în interiorul poienii (contur neregulat boundary_r)."""
+        a = math.atan2(y, x)
+        lim = boundary_r(a) - self.goal_clearance
+        r = math.hypot(x, y)
+        if r > lim and r > 1e-6:
+            s = lim / r
+            x *= s
+            y *= s
+        return x, y
+
+    def _goal_blocked(self, x, y):
+        if not in_navigable(x, y, margin=self.goal_clearance):
+            return True
+        if terrain_slope(x, y) > self.max_goal_slope:
+            return True
+        for obs in self.current_map_obstacles:
+            if math.hypot(x - obs["x"], y - obs["y"]) <= obs["r"] + self.goal_clearance:
+                return True
+        return False
+
+    def _make_goal_safe(self, gx, gy):
+        """Împinge un goal cerut de utilizator în zona navigabilă, ferit de obstacole."""
+        margin = self.goal_clearance
+        x, y = self._clamp_to_arena(gx, gy)
+        adjusted = (x != gx) or (y != gy)
+
+        for _ in range(25):
+            moved = False
+            for obs in self.current_map_obstacles:
+                dx = x - obs["x"]
+                dy = y - obs["y"]
+                dist = math.hypot(dx, dy)
+                min_dist = obs["r"] + margin
+                if dist < min_dist:
+                    ang = math.atan2(dy, dx) if dist > 1e-6 else random.uniform(-math.pi, math.pi)
+                    x = obs["x"] + math.cos(ang) * (min_dist + 0.1)
+                    y = obs["y"] + math.sin(ang) * (min_dist + 0.1)
+                    moved = True
+                    adjusted = True
+            x, y = self._clamp_to_arena(x, y)
+            if not moved:
+                break
+        return x, y, adjusted
+
+    def _sample_free_goal(self, start_x, start_y, min_dist=2.0, max_dist=None):
+        lim = self.arena_limit - self.goal_clearance
+        for _ in range(600):
+            gx = random.uniform(-lim, lim)
+            gy = random.uniform(-lim, lim)
+            if self._goal_blocked(gx, gy):
+                continue
+            d = math.hypot(gx - start_x, gy - start_y)
+            if d < min_dist:
+                continue
+            if max_dist is not None and d > max_dist:
+                continue
+            return gx, gy
+        # fallback: împinge un punct random în zona navigabilă, ferit de obstacole
+        gx, gy, _ = self._make_goal_safe(
+            random.uniform(-lim, lim), random.uniform(-lim, lim))
+        return gx, gy
+
+    def _sample_free_start(self, max_tries=400):
+        """Alege o poziție de pornire random în poiană: navigabilă, pe pantă
+        traversabilă și ferită de obstacole (ține cont de gabaritul robotului).
+        Fallback: centrul (zona plată de spawn e mereu liberă)."""
+        lim = self.arena_limit - self.start_clearance
+        clear = self.start_clearance
+        for _ in range(max_tries):
+            sx = random.uniform(-lim, lim)
+            sy = random.uniform(-lim, lim)
+            if not in_navigable(sx, sy, margin=clear):
+                continue
+            if terrain_slope(sx, sy) > self.max_goal_slope:
+                continue
+            blocked = False
+            for obs in self.current_map_obstacles:
+                if math.hypot(sx - obs["x"], sy - obs["y"]) <= obs["r"] + clear:
+                    blocked = True
+                    break
+            if not blocked:
+                return sx, sy
+        return 0.0, 0.0
 
     def set_goal(self, gx, gy):
         """Setează goal-ul din exterior (Tkinter / tastă G)."""
@@ -114,14 +475,8 @@ class ScoutEnv:
 
         self.goal_x = safe_x
         self.goal_y = safe_y
-        self.current_avoidance_target = None
-        self.completed_avoidance_targets = []
-        self.current_underpass_stage = 0
-        self.goal_on_traversable = self._point_in_traversable(self.goal_x, self.goal_y)
         self._move_goal_marker()
-        nav_x, nav_y, nav_kind = self.get_navigation_target()
-        self.prev_nav_kind = nav_kind
-        self.prev_distance = math.sqrt((nav_x - self.x) ** 2 + (nav_y - self.y) ** 2)
+        self.prev_distance, _ = self.world_to_robot_frame(self.goal_x, self.goal_y)
 
         if adjusted:
             print(
@@ -131,475 +486,33 @@ class ScoutEnv:
         print(f"[ENV] Goal actualizat → ({self.goal_x:.2f}, {self.goal_y:.2f})")
 
     def _move_goal_marker(self):
-        """Mută conul vizual la pozița goal-ului."""
         if self.goal_translation_field is not None:
             marker_z = self._surface_z_at(self.goal_x, self.goal_y) + self.goal_marker_z
-            self.goal_translation_field.setSFVec3f(
-                [self.goal_x, self.goal_y, marker_z]
-            )
-
-    def _point_in_rect_region(self, region, x, y, margin=0.0):
-        half_x = region["sx"] / 2.0 + margin
-        half_y = region["sy"] / 2.0 + margin
-        return (
-            region["x"] - half_x <= x <= region["x"] + half_x and
-            region["y"] - half_y <= y <= region["y"] + half_y
-        )
-
-    def _point_in_traversable(self, x, y, margin=0.0):
-        for region in self.traversable_regions:
-            if region["slope_deg"] <= self.max_traversable_slope_deg:
-                if self._point_in_rect_region(region, x, y, margin):
-                    return True
-        return False
-
-    def _region_for_point(self, x, y, margin=0.0):
-        for region in self.traversable_regions:
-            if region["slope_deg"] <= self.max_traversable_slope_deg:
-                if self._point_in_rect_region(region, x, y, margin):
-                    return region
-        return None
-
-    def _clamp(self, value, low, high):
-        return max(low, min(value, high))
-
-    def _ramp_lane_y(self, region, y):
-        half_y = region["sy"] / 2.0
-        side_margin = region.get("side_margin", 0.35)
-        lane_half_y = max(0.1, half_y - side_margin)
-        return self._clamp(y, region["y"] - lane_half_y, region["y"] + lane_half_y)
-
-    def _point_in_ramp_lane(self, region, x, y, margin=0.0):
-        half_x = region["sx"] / 2.0 + margin
-        half_y = region["sy"] / 2.0
-        side_margin = region.get("side_margin", 0.35)
-        lane_half_y = max(0.1, half_y - side_margin) + margin
-        return (
-            region["x"] - half_x <= x <= region["x"] + half_x and
-            region["y"] - lane_half_y <= y <= region["y"] + lane_half_y
-        )
-
-    def _ramp_access_target(self, region):
-        half_x = region["sx"] / 2.0
-        entry_margin = region.get("entry_margin", 0.55)
-        entry_y = self._ramp_lane_y(region, self.goal_y)
-
-        left_entry = (region["x"] - half_x - entry_margin, entry_y)
-        right_entry = (region["x"] + half_x + entry_margin, entry_y)
-
-        left_dist = math.sqrt((self.x - left_entry[0]) ** 2 + (self.y - left_entry[1]) ** 2)
-        right_dist = math.sqrt((self.x - right_entry[0]) ** 2 + (self.y - right_entry[1]) ** 2)
-        return left_entry if left_dist <= right_dist else right_entry
-
-    def _ramp_side_clear_target(self, region, access_x):
-        half_y = region["sy"] / 2.0
-        entry_margin = region.get("entry_margin", 0.55)
-        side = 1.0 if self.y >= region["y"] else -1.0
-        return access_x, region["y"] + side * (half_y + entry_margin)
-
-    def _underpass_target(self):
-        """Planifica trecerea pe sub rampa cand goal-ul este pe sol, dincolo de ea."""
-        if self.goal_on_traversable:
-            return None
-
-        for region in self.traversable_regions:
-            if region["type"] != "ramp":
-                continue
-            if not self._path_crosses_traversable():
-                continue
-
-            half_y = region["sy"] / 2.0
-            entry_margin = region.get("entry_margin", 0.55) + 0.25
-            goal_side = 1.0 if self.goal_y >= region["y"] else -1.0
-            robot_side = 1.0 if self.y >= region["y"] else -1.0
-
-            if goal_side == robot_side and not self._point_in_rect_region(region, self.x, self.y, margin=0.35):
-                continue
-
-            entry_side = -goal_side
-            entry = (region["x"], region["y"] + entry_side * (half_y + entry_margin))
-            exit_target = (region["x"], region["y"] + goal_side * (half_y + entry_margin))
-            aligned_with_underpass = abs(self.x - region["x"]) <= 0.9
-
-            if self.current_underpass_stage == 0:
-                entry_reached = self._target_distance(entry) <= self.underpass_reached_radius
-                crossed_entry_side = aligned_with_underpass and (self.y - region["y"]) * entry_side < half_y
-                if entry_reached or crossed_entry_side:
-                    self.current_underpass_stage = 1
-                else:
-                    return entry[0], entry[1], "underpass_entry"
-
-            if self.current_underpass_stage == 1:
-                exit_reached = self._target_distance(exit_target) <= self.underpass_reached_radius
-                crossed_exit_side = aligned_with_underpass and (self.y - region["y"]) * goal_side > half_y
-                if exit_reached or crossed_exit_side:
-                    self.current_underpass_stage = 2
-                    return None
-                return exit_target[0], exit_target[1], "underpass_exit"
-
-        return None
-
-    def get_navigation_target(self):
-        """Returneaza targetul activ: goal final, punct de acces sau waypoint de ocolire."""
-        region = self._region_for_point(self.goal_x, self.goal_y)
-        if region is None or region["type"] != "ramp":
-            underpass_target = self._underpass_target()
-            if underpass_target is not None:
-                return underpass_target
-
-            avoid_target = self._obstacle_avoidance_target()
-            if avoid_target is not None:
-                return avoid_target[0], avoid_target[1], "obstacle_avoid"
-            return self.goal_x, self.goal_y, "goal"
-
-        access_x, access_y = self._ramp_access_target(region)
-        side_x, side_y = self._ramp_side_clear_target(region, access_x)
-        access_distance = math.sqrt((self.x - access_x) ** 2 + (self.y - access_y) ** 2)
-        side_distance = math.sqrt((self.x - side_x) ** 2 + (self.y - side_y) ** 2)
-        on_valid_lane = self._point_in_ramp_lane(region, self.x, self.y, margin=0.15)
-
-        if not on_valid_lane and access_distance > self.ramp_access_reached_radius:
-            if abs(self.x - access_x) > 0.45 and side_distance > 0.35:
-                return side_x, side_y, "ramp_side_clear"
-            return access_x, access_y, "ramp_access"
-
-        return self.goal_x, self.goal_y, "goal"
-
-    def _target_distance(self, target):
-        return math.sqrt((self.x - target[0]) ** 2 + (self.y - target[1]) ** 2)
-
-    def _rect_bounds(self, obstacle, margin=0.0):
-        half_x = obstacle["sx"] / 2.0 + margin
-        half_y = obstacle["sy"] / 2.0 + margin
-        return (
-            obstacle["x"] - half_x,
-            obstacle["x"] + half_x,
-            obstacle["y"] - half_y,
-            obstacle["y"] + half_y,
-        )
-
-    def _point_in_obstacle(self, obstacle, x, y, margin=0.0):
-        if obstacle["type"] == "rect":
-            min_x, max_x, min_y, max_y = self._rect_bounds(obstacle, margin)
-            return min_x <= x <= max_x and min_y <= y <= max_y
-
-        if obstacle["type"] == "circle":
-            return math.sqrt((x - obstacle["x"]) ** 2 + (y - obstacle["y"]) ** 2) <= obstacle["r"] + margin
-
-        return False
-
-    def _segment_intersects_rect(self, x1, y1, x2, y2, obstacle, margin=0.0):
-        min_x, max_x, min_y, max_y = self._rect_bounds(obstacle, margin)
-        dx = x2 - x1
-        dy = y2 - y1
-        t_min = 0.0
-        t_max = 1.0
-
-        for p, q in ((-dx, x1 - min_x), (dx, max_x - x1), (-dy, y1 - min_y), (dy, max_y - y1)):
-            if abs(p) < 1e-9:
-                if q < 0.0:
-                    return False
-                continue
-
-            t = q / p
-            if p < 0.0:
-                if t > t_max:
-                    return False
-                t_min = max(t_min, t)
-            else:
-                if t < t_min:
-                    return False
-                t_max = min(t_max, t)
-
-        return t_max > 0.02 and t_min < 0.98
-
-    def _segment_intersects_circle(self, x1, y1, x2, y2, obstacle, margin=0.0):
-        radius = obstacle["r"] + margin
-        dx = x2 - x1
-        dy = y2 - y1
-        length_sq = dx * dx + dy * dy
-        if length_sq <= 1e-9:
-            return self._point_in_obstacle(obstacle, x1, y1, margin)
-
-        t = ((obstacle["x"] - x1) * dx + (obstacle["y"] - y1) * dy) / length_sq
-        t = max(0.0, min(1.0, t))
-        closest_x = x1 + t * dx
-        closest_y = y1 + t * dy
-        return math.sqrt((closest_x - obstacle["x"]) ** 2 + (closest_y - obstacle["y"]) ** 2) <= radius
-
-    def _segment_intersects_obstacle(self, x1, y1, x2, y2, obstacle, margin=0.0):
-        if obstacle["type"] == "rect":
-            return self._segment_intersects_rect(x1, y1, x2, y2, obstacle, margin)
-        if obstacle["type"] == "circle":
-            return self._segment_intersects_circle(x1, y1, x2, y2, obstacle, margin)
-        return False
-
-    def _first_blocking_obstacle(self, x1, y1, x2, y2, margin=None, ignore=None):
-        margin = self.path_clearance if margin is None else margin
-        closest_obstacle = None
-        closest_distance = float("inf")
-
-        for obstacle in self.current_map_obstacles:
-            if ignore is obstacle:
-                continue
-            if not self._segment_intersects_obstacle(x1, y1, x2, y2, obstacle, margin):
-                continue
-
-            distance = math.sqrt((obstacle["x"] - x1) ** 2 + (obstacle["y"] - y1) ** 2)
-            if distance < closest_distance:
-                closest_distance = distance
-                closest_obstacle = obstacle
-
-        return closest_obstacle
-
-    def _waypoint_is_clear(self, wx, wy, blocking_obstacle):
-        if abs(wx) > self.arena_limit - 0.4 or abs(wy) > self.arena_limit - 0.4:
-            return False
-
-        for done_x, done_y in self.completed_avoidance_targets:
-            if math.sqrt((wx - done_x) ** 2 + (wy - done_y) ** 2) < self.avoidance_reached_radius:
-                return False
-
-        for obstacle in self.current_map_obstacles:
-            if self._point_in_obstacle(obstacle, wx, wy, self.path_clearance * 0.7):
-                return False
-
-        start_blocked = self._first_blocking_obstacle(
-            self.x, self.y, wx, wy,
-            margin=0.15,
-        )
-        goal_blocked = self._first_blocking_obstacle(
-            wx, wy, self.goal_x, self.goal_y,
-            margin=0.15,
-        )
-        return start_blocked is None and goal_blocked is None
-
-    def _rect_avoidance_candidates(self, obstacle):
-        min_x, max_x, min_y, max_y = self._rect_bounds(
-            obstacle,
-            self.path_clearance + self.corner_clearance,
-        )
-        return [
-            (min_x, min_y),
-            (min_x, max_y),
-            (max_x, min_y),
-            (max_x, max_y),
-        ]
-
-    def _circle_avoidance_candidates(self, obstacle):
-        radius = obstacle["r"] + self.path_clearance + self.corner_clearance
-        return [
-            (obstacle["x"] + radius, obstacle["y"]),
-            (obstacle["x"] - radius, obstacle["y"]),
-            (obstacle["x"], obstacle["y"] + radius),
-            (obstacle["x"], obstacle["y"] - radius),
-        ]
-
-    def _obstacle_avoidance_target(self):
-        if self.current_avoidance_target is not None:
-            if self._first_blocking_obstacle(
-                    self.x, self.y, self.goal_x, self.goal_y,
-                    margin=self.path_clearance) is None:
-                self.current_avoidance_target = None
-                return None
-
-            if self._target_distance(self.current_avoidance_target) <= self.avoidance_reached_radius:
-                self.completed_avoidance_targets.append(self.current_avoidance_target)
-                self.current_avoidance_target = None
-            else:
-                return self.current_avoidance_target
-
-        blocking_obstacle = self._first_blocking_obstacle(
-            self.x, self.y, self.goal_x, self.goal_y,
-            margin=self.path_clearance,
-        )
-        if blocking_obstacle is None:
-            return None
-
-        if blocking_obstacle["type"] == "rect":
-            candidates = self._rect_avoidance_candidates(blocking_obstacle)
-        elif blocking_obstacle["type"] == "circle":
-            candidates = self._circle_avoidance_candidates(blocking_obstacle)
-        else:
-            return None
-
-        best = None
-        best_score = float("inf")
-        for wx, wy in candidates:
-            if not self._waypoint_is_clear(wx, wy, blocking_obstacle):
-                continue
-
-            score = (
-                math.sqrt((wx - self.x) ** 2 + (wy - self.y) ** 2) +
-                math.sqrt((self.goal_x - wx) ** 2 + (self.goal_y - wy) ** 2)
-            )
-            if score < best_score:
-                best_score = score
-                best = (wx, wy)
-
-        self.current_avoidance_target = best
-        return best
-
-    def get_navigation_error(self):
-        nav_x, nav_y, nav_kind = self.get_navigation_target()
-        dx = nav_x - self.x
-        dy = nav_y - self.y
-        distance = math.sqrt(dx ** 2 + dy ** 2)
-        angle = math.atan2(dy, dx) - self.theta
-        angle = math.atan2(math.sin(angle), math.cos(angle))
-        return distance, angle, nav_kind
-
-    def _surface_z_at(self, x, y):
-        for region in self.traversable_regions:
-            if not self._point_in_rect_region(region, x, y):
-                continue
-
-            if region["type"] != "ramp":
-                return 0.0
-
-            half_x = region["sx"] / 2.0
-            top_half = half_x * region["top_fraction"]
-            rel_x = x - region["x"]
-            height = region["height"]
-
-            if abs(rel_x) <= top_half:
-                return height
-
-            ramp_run = max(half_x - top_half, 0.001)
-            if rel_x < -top_half:
-                return height * max(0.0, min(1.0, (rel_x + half_x) / ramp_run))
-            return height * max(0.0, min(1.0, (half_x - rel_x) / ramp_run))
-
-        return 0.0
-
-    def _path_crosses_traversable(self, samples=12):
-        for i in range(1, samples + 1):
-            t = i / samples
-            px = self.x + (self.goal_x - self.x) * t
-            py = self.y + (self.goal_y - self.y) * t
-            if self._point_in_traversable(px, py, margin=0.35):
-                return True
-        return False
-
-    def should_drive_over_traversable(self):
-        nav_x, nav_y, nav_kind = self.get_navigation_target()
-        if nav_kind != "goal":
-            return False
-
-        if abs(self.roll) > self.max_safe_roll or abs(self.pitch) > self.max_safe_pitch:
-            return False
-
-        region = self._region_for_point(self.goal_x, self.goal_y)
-        if region is None:
-            return False
-
-        access_x, access_y = self._ramp_access_target(region)
-        near_access = math.sqrt((self.x - access_x) ** 2 + (self.y - access_y) ** 2) < self.ramp_commit_distance
-        on_valid_lane = self._point_in_ramp_lane(region, self.x, self.y, margin=0.35)
-        if not (near_access or on_valid_lane):
-            return False
-
-        dx = nav_x - self.x
-        dy = nav_y - self.y
-        distance = math.sqrt(dx ** 2 + dy ** 2)
-        if distance > 8.0:
-            return False
-
-        goal_angle = math.atan2(dy, dx) - self.theta
-        goal_angle = math.atan2(math.sin(goal_angle), math.cos(goal_angle))
-        return abs(goal_angle) < 0.65
-
-    def can_attempt_traversable_ahead(self, state):
-        front, left, right, front_left, front_right, upper_front, mid_front, \
-            height_profile, distance_norm, angle_norm, v_norm, w_norm, \
-            z_norm, roll_norm, pitch_norm, yaw_rate_norm = state
-
-        if abs(self.roll) > self.max_safe_roll or abs(self.pitch) > self.max_safe_pitch:
-            return False
-
-        nav_distance, nav_angle, nav_kind = self.get_navigation_error()
-        if not self.goal_on_traversable or nav_kind not in ("goal", "ramp_access"):
-            return False
-
-        if nav_distance > 8.0 or abs(nav_angle) > 0.55:
-            return False
-
-        lower_close = front < 0.22 or front_left < 0.18 or front_right < 0.18
-        upper_clear = upper_front > front + 0.10 and upper_front > 0.20
-        middle_not_blocked = mid_front > front + 0.03
-        return lower_close and upper_clear and middle_not_blocked
-
-    def is_on_traversable_terrain(self):
-        region = self._region_for_point(self.x, self.y, margin=0.25)
-        return region is not None and self.z > 0.12
-
-    def _make_goal_safe(self, gx, gy):
-        """Mută goal-ul în afara obstacolelor simple din harta curentă."""
-        adjusted = False
-        margin = self.goal_clearance
-
-        x = max(min(gx, self.arena_limit - margin), -self.arena_limit + margin)
-        y = max(min(gy, self.arena_limit - margin), -self.arena_limit + margin)
-        adjusted = adjusted or x != gx or y != gy
-
-        for obstacle in self.current_map_obstacles:
-            if obstacle["type"] == "rect":
-                half_x = obstacle["sx"] / 2.0 + margin
-                half_y = obstacle["sy"] / 2.0 + margin
-                min_x = obstacle["x"] - half_x
-                max_x = obstacle["x"] + half_x
-                min_y = obstacle["y"] - half_y
-                max_y = obstacle["y"] + half_y
-
-                if min_x <= x <= max_x and min_y <= y <= max_y:
-                    distances = {
-                        "left": abs(x - min_x),
-                        "right": abs(max_x - x),
-                        "bottom": abs(y - min_y),
-                        "top": abs(max_y - y),
-                    }
-                    nearest_side = min(distances, key=distances.get)
-                    if nearest_side == "left":
-                        x = min_x - 0.05
-                    elif nearest_side == "right":
-                        x = max_x + 0.05
-                    elif nearest_side == "bottom":
-                        y = min_y - 0.05
-                    else:
-                        y = max_y + 0.05
-                    adjusted = True
-
-            elif obstacle["type"] == "circle":
-                dx = x - obstacle["x"]
-                dy = y - obstacle["y"]
-                distance = math.sqrt(dx ** 2 + dy ** 2)
-                min_distance = obstacle["r"] + margin
-
-                if distance < min_distance:
-                    angle = math.atan2(dy, dx) if distance > 0 else 0.0
-                    x = obstacle["x"] + math.cos(angle) * (min_distance + 0.05)
-                    y = obstacle["y"] + math.sin(angle) * (min_distance + 0.05)
-                    adjusted = True
-
-        x = max(min(x, self.arena_limit - margin), -self.arena_limit + margin)
-        y = max(min(y, self.arena_limit - margin), -self.arena_limit + margin)
-        return x, y, adjusted
+            self.goal_translation_field.setSFVec3f([self.goal_x, self.goal_y, marker_z])
 
     # ------------------------------------------------------------------
 
-    def reset(self, start_x=0.0, start_y=0.0, start_theta=0.0, random_goal=True):
-        """
-        Resetează episodul.
-        - start_x/y/theta: poziția de start a robotului
-        - random_goal: True în training, False în eval (goal setat extern)
-        """
+    def reset(self, start_x=0.0, start_y=0.0, start_theta=0.0,
+              random_goal=True, goal_max_dist=None, random_start=False):
+        """Resetează episodul. goal_max_dist permite curriculum (ținte mai
+        apropiate la început). random_start=True alege o poziție de pornire
+        random navigabilă (altfel folosește start_x/start_y/start_theta date)."""
 
         for m in self.motors:
             m.setVelocity(0.0)
 
-        self.translation_field.setSFVec3f([start_x, start_y, 0.05])
+        # Obstacolele sunt statice → le citim înainte de a plasa robotul/goal-ul,
+        # ca eșantionarea start-ului și a goal-ului random să le poată evita.
+        self.scan_world_obstacles()
 
-        # Conversie theta -> rotatie Webots in planul hartii (axa Z este verticala).
+        if random_start:
+            start_x, start_y = self._sample_free_start()
+            start_theta = random.uniform(-math.pi, math.pi)
+
+        # Roțile Pioneer ating solul când originea e la nivelul suprafeței
+        # (ancoră roată z=0.11, rază 0.11 → contact la z=0). Mică gardă de 3 cm.
+        start_z = self._surface_z_at(start_x, start_y) + 0.03
+        self.translation_field.setSFVec3f([start_x, start_y, start_z])
         self.rotation_field.setSFRotation([0, 0, 1, start_theta])
 
         self.robot.simulationResetPhysics()
@@ -615,27 +528,19 @@ class ScoutEnv:
         self.w_prev = 0.0
         self.step_count = 0
         self.done_reason = None
-        self.current_avoidance_target = None
-        self.completed_avoidance_targets = []
-        self.current_underpass_stage = 0
+
+        # Ancoră anti-blocaj la poziția reală de pornire.
+        self._stuck_anchor_x = self.x
+        self._stuck_anchor_y = self.y
+        self._stuck_anchor_step = 0
 
         if random_goal:
-            # Goal random, garantat diferit de start și în arenă
-            while True:
-                gx = random.uniform(-self.arena_limit, self.arena_limit)
-                gy = random.uniform(-self.arena_limit, self.arena_limit)
-                gx, gy, adjusted = self._make_goal_safe(gx, gy)
-                dist = math.sqrt((gx - start_x) ** 2 + (gy - start_y) ** 2)
-                if dist > 2.0 and not adjusted:  # minim 2m distanță față de start
-                    break
+            gx, gy = self._sample_free_goal(start_x, start_y, max_dist=goal_max_dist)
             self.goal_x = gx
             self.goal_y = gy
-            self.goal_on_traversable = self._point_in_traversable(self.goal_x, self.goal_y)
             self._move_goal_marker()
 
-        nav_x, nav_y, nav_kind = self.get_navigation_target()
-        self.prev_nav_kind = nav_kind
-        self.prev_distance = math.sqrt((nav_x - self.x) ** 2 + (nav_y - self.y) ** 2)
+        self.prev_distance, _ = self.world_to_robot_frame(self.goal_x, self.goal_y)
 
         self.last_state = self._get_state()
         return self.last_state
@@ -672,28 +577,25 @@ class ScoutEnv:
     # ------------------------------------------------------------------
 
     def _apply_action(self, action):
-        # -1 - reverse scurt (folosit doar de controllerul simplu pentru recuperare)
-        # 0 - forward
-        # 1 - forward-left
-        # 2 - forward-right
-        # 3 - rotate left
-        # 4 - rotate right
-
+        # 0 - forward, 1 - forward-left, 2 - forward-right,
+        # 3 - rotate left, 4 - rotate right, -1 - reverse scurt (baseline)
         if action == -1:
-            v_target, w_target = -0.25,  0.0
+            v_target, w_target = -0.25, 0.0
         elif action == 0:
-            v_target, w_target = 0.55,  0.0
+            v_target, w_target = 0.55, 0.0
         elif action == 1:
-            v_target, w_target = 0.45,  1.0
+            v_target, w_target = 0.45, 1.0
         elif action == 2:
             v_target, w_target = 0.45, -1.0
         elif action == 3:
-            v_target, w_target = 0.0,  1.6
+            v_target, w_target = 0.0, 1.6
         elif action == 4:
             v_target, w_target = 0.0, -1.6
         else:
-            v_target, w_target = 0.0,  0.0
+            v_target, w_target = 0.0, 0.0
 
+        # Control diferențial cu limite dinamice de accelerație
+        # (mapare comandă de nivel înalt (v, ω) → viteze de roți).
         dv = v_target - self.v_prev
         dv = max(min(dv, self.MAX_ACC_V * self.dt), -self.MAX_ACC_V * self.dt)
         self.v = self.v_prev + dv
@@ -705,10 +607,10 @@ class ScoutEnv:
         self.v_prev = self.v
         self.w_prev = self.w
 
-        v_left  = (self.v - (self.L / 2.0) * self.w) / self.R
+        v_left = (self.v - (self.L / 2.0) * self.w) / self.R
         v_right = (self.v + (self.L / 2.0) * self.w) / self.R
 
-        v_left  = max(min(v_left,  self.MAX_WHEEL_SPEED), -self.MAX_WHEEL_SPEED)
+        v_left = max(min(v_left, self.MAX_WHEEL_SPEED), -self.MAX_WHEEL_SPEED)
         v_right = max(min(v_right, self.MAX_WHEEL_SPEED), -self.MAX_WHEEL_SPEED)
 
         # [FL, BL, FR, BR]
@@ -720,7 +622,8 @@ class ScoutEnv:
     # ------------------------------------------------------------------
 
     def _update_odometry(self):
-        # In simulator folosim GPS daca exista; Supervisor ramane fallback pentru testare.
+        # Localizarea robotului: GPS pentru poziție, IMU pentru atitudine,
+        # gyro/accelerometru pentru rate. Supervisor rămâne fallback.
         pos = self.gps.getValues() if self.gps is not None else self.robot_node.getPosition()
         self.x = pos[0]
         self.y = pos[1]
@@ -730,7 +633,6 @@ class ScoutEnv:
             self.roll, self.pitch, self.yaw = self.imu.getRollPitchYaw()
             self.theta = self.yaw
         else:
-            # Orientare reala: axa locala +X a robotului proiectata in planul XY.
             orientation = self.robot_node.getOrientation()
             self.theta = math.atan2(orientation[3], orientation[0])
 
@@ -742,17 +644,9 @@ class ScoutEnv:
             self.acceleration = self.accelerometer.getValues()
 
     # ------------------------------------------------------------------
-
-    def _safe_range(self, ranges, idx, max_range):
-        if ranges is None or len(ranges) == 0:
-            return max_range
-        idx = max(0, min(idx, len(ranges) - 1))
-        value = ranges[idx]
-        if math.isinf(value) or math.isnan(value):
-            return max_range
-        return min(value, max_range)
-
-    def _lidar_value(self, ranges, layer, horizontal_index, max_range):
+    # LiDAR + filtrare spațială prin convoluție 2D
+    # ------------------------------------------------------------------
+    def _lidar_dimensions(self, ranges):
         try:
             horizontal_resolution = self.lidar.getHorizontalResolution()
             layers = self.lidar.getNumberOfLayers()
@@ -763,77 +657,92 @@ class ScoutEnv:
         if horizontal_resolution > 0 and len(ranges) >= horizontal_resolution:
             detected_layers = max(1, len(ranges) // horizontal_resolution)
             layers = min(max(1, layers), detected_layers)
+        return max(1, horizontal_resolution), max(1, layers)
 
-        if layers <= 1 or horizontal_resolution <= 0:
-            return self._safe_range(ranges, horizontal_index, max_range)
+    @staticmethod
+    def _conv2d_smooth(image):
+        """Filtrare spațială (netezire) prin convoluție 2D separabilă cu
+        nucleul [1,2,1]/4 pe ambele axe → reduce zgomotul senzorului LiDAR
+        înainte de extragerea trăsăturilor. Margini tratate prin replicare."""
+        kernel = np.array([1.0, 2.0, 1.0])
+        kernel = kernel / kernel.sum()
 
-        layer = max(0, min(layer, layers - 1))
-        horizontal_index = max(0, min(horizontal_index, horizontal_resolution - 1))
-        idx = layer * horizontal_resolution + horizontal_index
-        return self._safe_range(ranges, idx, max_range)
+        padded = np.pad(image, ((1, 1), (1, 1)), mode="edge")
+        # convoluție pe orizontală
+        tmp = (padded[:, :-2] * kernel[0] +
+               padded[:, 1:-1] * kernel[1] +
+               padded[:, 2:] * kernel[2])
+        # convoluție pe verticală
+        out = (tmp[:-2, :] * kernel[0] +
+               tmp[1:-1, :] * kernel[1] +
+               tmp[2:, :] * kernel[2])
+        return out
 
     def _get_lidar_features(self):
         ranges = self.lidar.getRangeImage()
         max_range = 10.0
+        n, layers = self._lidar_dimensions(ranges)
 
-        try:
-            horizontal_resolution = self.lidar.getHorizontalResolution()
-            layers = self.lidar.getNumberOfLayers()
-        except AttributeError:
-            horizontal_resolution = len(ranges)
-            layers = 1
+        # Construiește imaginea 2D (layers × n), curăță inf/nan, limitează.
+        data = np.asarray(ranges, dtype=np.float32)
+        data = data[: n * layers].reshape(layers, n) if data.size >= n * layers \
+            else np.full((layers, n), max_range, dtype=np.float32)
+        data = np.where(np.isfinite(data), data, max_range)
+        data = np.clip(data, 0.0, max_range)
 
-        if horizontal_resolution > 0 and len(ranges) >= horizontal_resolution:
-            detected_layers = max(1, len(ranges) // horizontal_resolution)
-            layers = min(max(1, layers), detected_layers)
+        smoothed = self._conv2d_smooth(data) if (layers >= 3 and n >= 3) else data
 
-        n = max(1, horizontal_resolution)
-        lower_layer = max(0, layers - 1)
-        upper_layer = 0
-        mid_layer = max(0, layers // 2)
+        lower = layers - 1
+        upper = 0
+        mid = layers // 2
 
-        front_raw = self._lidar_value(ranges, lower_layer, n // 2, max_range)
-        left_raw = self._lidar_value(ranges, lower_layer, 3 * n // 4, max_range)
-        right_raw = self._lidar_value(ranges, lower_layer, n // 4, max_range)
-        front_left_raw = self._lidar_value(ranges, lower_layer, 5 * n // 8, max_range)
-        front_right_raw = self._lidar_value(ranges, lower_layer, 3 * n // 8, max_range)
-        upper_front_raw = self._lidar_value(ranges, upper_layer, n // 2, max_range)
-        mid_front_raw = self._lidar_value(ranges, mid_layer, n // 2, max_range)
+        # 12 sectoare uniforme (min-pooling) care ACOPERĂ COMPLET FOV-ul
+        # orizontal de 180°: trăsătura k = minimul distanțelor din sectorul
+        # său de 15°. Vechile 5 sectoare frontale vedeau doar ±56° — zonele
+        # laterale (±56°..±90°) erau OARBE, deci robotul „agăța cu umărul"
+        # obstacole la viraje strânse printre copaci/moloz (o parte din cele
+        # 23% coliziuni la evaluarea run 4). Min-pooling pe sector garantează
+        # că cel mai apropiat obstacol din fiecare con intră în starea RL.
+        row = smoothed[lower]
+        ns = N_LIDAR_SECTORS
+        sectors = [float(row[k * n // ns:(k + 1) * n // ns].min()) / max_range
+                   for k in range(ns)]
 
-        front       = front_raw / max_range
-        left        = left_raw / max_range
-        right       = right_raw / max_range
-        front_left  = front_left_raw / max_range
-        front_right = front_right_raw / max_range
+        # Profil vertical pe conul frontal central (±7.5°): straturile de
+        # sus/mijloc + diferența sus−jos (obstacol scund vs. perete înalt).
+        cw = max(1, n // 24)
+        lo, hi = n // 2 - cw, n // 2 + cw + 1
+        front_low_raw = float(row[lo:hi].min())
+        upper_front_raw = float(smoothed[upper, lo:hi].min())
+        mid_front_raw = float(smoothed[mid, lo:hi].min())
+
         upper_front = upper_front_raw / max_range
         mid_front = mid_front_raw / max_range
-        height_profile = max(-1.0, min(1.0, (upper_front_raw - front_raw) / max_range))
+        height_profile = max(-1.0, min(1.0, (upper_front_raw - front_low_raw) / max_range))
 
-        return front, left, right, front_left, front_right, upper_front, mid_front, height_profile
+        return sectors, upper_front, mid_front, height_profile
+
+    # ------------------------------------------------------------------
 
     def _get_state(self):
-        front, left, right, front_left, front_right, upper_front, mid_front, height_profile = \
-            self._get_lidar_features()
+        sectors, upper_front, mid_front, height_profile = self._get_lidar_features()
 
-        nav_x, nav_y, _ = self.get_navigation_target()
-        dx = nav_x - self.x
-        dy = nav_y - self.y
+        distance, angle = self.world_to_robot_frame(self.goal_x, self.goal_y)
 
-        distance = math.sqrt(dx ** 2 + dy ** 2)
-        angle    = math.atan2(dy, dx) - self.theta
-        angle    = math.atan2(math.sin(angle), math.cos(angle))
-
-        distance_norm = min(distance, 40.0) / 40.0
-        angle_norm    = angle / math.pi
-        v_norm        = self.v / 2.0
-        w_norm        = self.w / 4.0
-        z_norm        = max(0.0, min(self.z, 2.0)) / 2.0
-        roll_norm     = max(-1.0, min(1.0, self.roll / math.pi))
-        pitch_norm    = max(-1.0, min(1.0, self.pitch / math.pi))
+        distance_norm = min(distance, 120.0) / 120.0
+        angle_norm = angle / math.pi
+        v_norm = self.v / 2.0
+        w_norm = self.w / 4.0
+        z_norm = max(0.0, min(self.z, 2.0)) / 2.0
+        roll_norm = max(-1.0, min(1.0, self.roll / math.pi))
+        pitch_norm = max(-1.0, min(1.0, self.pitch / math.pi))
         yaw_rate_norm = max(-1.0, min(1.0, self.gyro_rate[2] / 5.0))
 
-        return [
-            front, left, right, front_left, front_right, upper_front, mid_front, height_profile,
+        # Layout stare (23): [0:12] sectoare LiDAR, [12:15] profil vertical
+        # frontal (sus/mijloc/diferență), [15] distanță goal, [16] unghi goal,
+        # [17:19] v/ω, [19:23] z/roll/pitch/yaw-rate.
+        return sectors + [
+            upper_front, mid_front, height_profile,
             distance_norm, angle_norm,
             v_norm, w_norm,
             z_norm, roll_norm, pitch_norm, yaw_rate_norm
@@ -842,64 +751,96 @@ class ScoutEnv:
     # ------------------------------------------------------------------
 
     def _compute_reward(self, state):
-        front, left, right, front_left, front_right, upper_front, mid_front, \
-            height_profile, distance_norm, angle_norm, v_norm, w_norm, \
-            z_norm, roll_norm, pitch_norm, yaw_rate_norm = state
+        sectors = state[:N_LIDAR_SECTORS]
+        angle_norm = state[N_LIDAR_SECTORS + 4]      # vezi layout-ul din _get_state
+
+        # Conul frontal = cele 2 sectoare centrale (±15°); flancurile
+        # apropiate = următoarele 2 pe fiecare parte (±15°..±45°).
+        front = min(sectors[5], sectors[6])
+        flank = min(sectors[3], sectors[4], sectors[7], sectors[8])
 
         reward = 0.0
 
-        final_distance = math.sqrt(
-            (self.goal_x - self.x) ** 2 +
-            (self.goal_y - self.y) ** 2
-        )
+        final_distance = math.hypot(self.goal_x - self.x, self.goal_y - self.y)
 
-        # Goal atins doar cand centrul robotului ajunge in centrul discului.
+        # Goal atins
         if final_distance <= self.goal_tolerance:
             self.done_reason = "goal"
             return 200.0, True
 
-        # 1. Progress spre goal
-        nav_x, nav_y, nav_kind = self.get_navigation_target()
-        nav_distance = math.sqrt((nav_x - self.x) ** 2 + (nav_y - self.y) ** 2)
-        if nav_kind != self.prev_nav_kind:
-            self.prev_distance = nav_distance
-            self.prev_nav_kind = nav_kind
+        # Răsturnare pe teren denivelat → terminare
+        if abs(self.roll) > self.max_safe_roll or abs(self.pitch) > self.max_safe_pitch:
+            self.done_reason = "rollover"
+            return -20.0, True
 
-        progress = self.prev_distance - nav_distance
+        # Ieșire de pe hartă: oprită fizic de pădurea deasă de la marginea
+        # pătratului; aici e doar plasa de siguranță RL (robotul nu cade de pe hartă).
+        if max(abs(self.x), abs(self.y)) > HALF - self.bounds_margin:
+            self.done_reason = "out_of_bounds"
+            return -20.0, True
+
+        # 1. Progres spre goal — ȘAPING-UL PRINCIPAL și SINGURUL termen
+        # pozitiv pe pas (potential-based shaping, Ng et al.): e anti-simetric,
+        # deci orice buclă închisă (cercuri, oscilații) însumează exact 0 —
+        # nefarmabil prin construcție.
+        progress = self.prev_distance - final_distance
         reward += progress * 20.0
 
-        # 2. Orientare spre goal
-        if abs(angle_norm) < 0.15:
-            reward += 1.0
-        reward -= abs(angle_norm) * 0.02
+        # 2. Orientare spre goal — DOAR penalizare de dezaliniere (≤ 0).
+        # Lecția run 3 (reward hacking): la γ=0.99, orice venit FLAT de r/pas
+        # valorează r/(1−γ) = 100·r. Vechiul bonus de orientare (+1/pas)
+        # valora ~100 — peste valoarea actualizată a unui goal îndepărtat
+        # (~35) — deci politica „parca" robotul cu fața la goal (53% stuck,
+        # opriri în câmp deschis). Nici condiționarea de progres nu e sigură
+        # (cercuri mici dau progres pozitiv jumătate din timp și ocolesc
+        # anti-stuck-ul), nici bonusul de spațiu liber (+0.2 ⇒ valoare ~20).
+        # De aceea AMBELE bonusuri flat au fost ELIMINATE: toți termenii pe
+        # pas sunt ≤ 0 în afara progresului → reward pozitiv cumulat cere
+        # apropiere netă de goal.
+        reward -= abs(angle_norm) * 0.05
 
-        # 3. Bonus mișcare în spațiu liber
-        min_dist = min(front, left, right, front_left, front_right)
-        if min_dist > 0.15:
-            reward += 0.2
+        min_dist = min(sectors)
 
-        # 4. Penalizări apropriere obstacol
+        # 3. Penalizări apropiere obstacol (din LiDAR)
         if front < 0.10:
             reward -= 1.0
         if front < 0.05:
             reward -= 2.0
-        if (left < 0.05 or right < 0.05 or
-                front_left < 0.05 or front_right < 0.05):
+        if flank < 0.05:
             reward -= 0.1
 
-        # 5. Living cost + penalizare rotație excesivă
+        # 4. Penalizare instabilitate (descurajează pantele riscante)
+        reward -= (abs(self.roll) + abs(self.pitch)) * 0.05
+
+        # 5. Living cost + penalizare rotație excesivă + cost de staționare
+        # (descurajează activ statul pe loc/pivotarea prelungită; o
+        # reorientare legitimă de 90° durează ~30 pași → cost ~0.6, neglijabil)
         reward -= 0.0005
         reward -= abs(self.w) * 0.002
+        if self.v < 0.1:
+            reward -= 0.02
 
-        # 6. Coliziune
+        # 6. Coliziune (LiDAR foarte aproape)
         if min_dist < 0.025:
-            if (self.should_drive_over_traversable() or
-                    self.can_attempt_traversable_ahead(state) or
-                    self.is_on_traversable_terrain()):
-                reward -= 1.0
-            else:
-                self.done_reason = "collision"
-                return -20.0, True
+            self.done_reason = "collision"
+            return -20.0, True
 
-        self.prev_distance = nav_distance
+        # 7. Anti-blocaj: dacă robotul nu s-a îndepărtat mai mult de
+        # stuck_move_thresh de ancoră în ultimii stuck_patience pași, e
+        # înțepenit/oscilează pe loc → încheie episodul (evită „rămas blocat
+        # până la reset"). Ocolirile reale mișcă robotul > prag → ancora se
+        # mută și contorul se resetează, deci nu sunt penalizate.
+        if math.hypot(self.x - self._stuck_anchor_x,
+                      self.y - self._stuck_anchor_y) > self.stuck_move_thresh:
+            self._stuck_anchor_x = self.x
+            self._stuck_anchor_y = self.y
+            self._stuck_anchor_step = self.step_count
+        elif self.step_count - self._stuck_anchor_step >= self.stuck_patience:
+            self.done_reason = "stuck"
+            # −20 (ca la coliziune): la −5, blocajul era aproape gratuit față
+            # de venitul acumulat stând pe loc — semnalul negativ trebuie să
+            # se propage clar în valorile Q ale comportamentului de „parcare".
+            return reward - 20.0, True
+
+        self.prev_distance = final_distance
         return reward, False

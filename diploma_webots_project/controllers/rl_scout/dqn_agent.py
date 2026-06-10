@@ -58,11 +58,12 @@ class ReplayBuffer:
         if len(self.buffer) < self.capacity:
             self.buffer.append(None)
 
+        # float32 compact (o listă Python de float-uri ocupă ~5× mai mult)
         self.buffer[self.position] = (
-            state,
+            np.asarray(state, dtype=np.float32),
             action,
             reward,
-            next_state,
+            np.asarray(next_state, dtype=np.float32),
             done
         )
 
@@ -104,17 +105,33 @@ class DQNAgent:
         self.target_network.eval()
 
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=5e-4)
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=5000, gamma=0.9)
+        # LR cu decădere lentă și PRAG MINIM. Vechiul StepLR(5000, 0.9) era
+        # apelat la FIECARE pas de antrenare (~1300 pași/episod → ×0.9 la
+        # fiecare ~4 episoade), deci lr ≈ 0 pe la ep. 300 — rețeaua îngheța
+        # exact când curriculum-ul ajungea la ținte îndepărtate (run-ul
+        # 2026-06-09: vârf avg50 la ep. 226, apoi stagnare 700 de episoade).
+        # Acum: 5e-4 → podea 1e-4 (factor 0.2), atinsă pe la ep. ~450.
+        self.scheduler = optim.lr_scheduler.LambdaLR(
+            self.optimizer, lambda step: max(0.2, 0.95 ** (step // 20000)))
 
         self.gamma = 0.99
 
         self.epsilon = 1.0
         self.epsilon_min = 0.01
-        self.epsilon_decay = 0.9995  # Decai mai lent pentru explorare mai bună
+        # Decădere PER EPISOD (apelată o dată/episod din bucla de training prin
+        # decay_epsilon()). Per-pas, epsilon se prăbușea la min pe la ep. 55:
+        # episoadele aleatoare ating 5000 pași, deci bugetul de explorare se
+        # consuma înainte ca curriculum-ul să introducă ținte îndepărtate.
+        # 0.993/episod → epsilon ~0.24 la ep.200, ~0.06 la ep.400 (final
+        # curriculum), atinge 0.01 pe la ep.650 → explorare vie tot curriculum-ul.
+        self.epsilon_decay = 0.993
 
         self.batch_size = 64
 
-        self.replay_buffer = ReplayBuffer(50000)  # Buffer mai mare
+        # 50k ≈ doar ~36 de episoade de istorie (~1400 pași/episod): episoadele
+        # rare cu succes la ținte îndepărtate erau suprascrise înainte să fie
+        # exploatate. 200k ≈ ~150 de episoade; stocat float32 → ~100 MB RAM.
+        self.replay_buffer = ReplayBuffer(200000)
 
         self.update_target_every = 500  # Update mai des pentru mai multă stabilitate
         self.step_counter = 0
@@ -145,10 +162,17 @@ class DQNAgent:
 
     # -----------------------------
 
+    def decay_epsilon(self):
+        """Decădere epsilon o dată pe episod (vezi epsilon_decay)."""
+        if self.epsilon > self.epsilon_min:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    # -----------------------------
+
     def train_step(self):
 
         if len(self.replay_buffer) < self.batch_size:
-            return
+            return None
 
         states, actions, rewards, next_states, dones = \
             self.replay_buffer.sample(self.batch_size)
@@ -184,3 +208,5 @@ class DQNAgent:
         # Update target network
         if self.step_counter % self.update_target_every == 0:
             self.target_network.load_state_dict(self.q_network.state_dict())
+
+        return loss.item()
