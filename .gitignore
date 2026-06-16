@@ -11,8 +11,8 @@ __pycache__/
 # Modele antrenate (fisierele grele)
 # Le ignoram pe toate pentru a nu bloca GitHub-ul
 *.pth
-# Daca pe viitor vei dori sa urci un singur model de referinta, poti decomenta (sterge #) linia de mai jos:
-# !dqn_model_best.pth
+# Model de referinta (headline run 5, best-avg50) — singurul .pth urmarit in git:
+!diploma_webots_project/controllers/rl_scout/dqn_model_best.pth
 
 # Fisiere de sistem si setari editoare cod
 .DS_Store

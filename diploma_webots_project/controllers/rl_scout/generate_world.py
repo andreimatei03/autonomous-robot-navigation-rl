@@ -20,8 +20,17 @@ Re-rulează după ce modifici terenul/conturul în scout_env.py.
 import math
 import os
 import random
+import sys
 
 import scout_env as S
+
+# Consola Windows e implicit cp1252 (fără „ă/ș/ț") → print-urile cu diacritice
+# din _validate() ar crăpa scriptul ÎNAINTE de scrierea fișierului (validarea
+# rulează înaintea write-ului). Forțăm UTF-8 unde se poate (la fel ca plot_metrics.py).
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 BASE = "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects"
 
