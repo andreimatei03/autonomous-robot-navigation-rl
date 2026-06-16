@@ -1,0 +1,5 @@
+set,N,succes_%,coliziune_%,stuck_%,rollover_%,out_of_bounds_%,timeout_%,pasi_medii_goal,SPL,SPL_n_traiectorii,eficienta_drum_%
+DQN — start random,100,64,22,13,0,0,1,2202,0.831,20,92
+DQN — start centru,100,80,12,7,0,0,1,1862,0.860,20,96
+DQN — hartă nevăzută,100,62,22,13,1,0,2,2172,0.668,20,95
+Baseline reactiv,100,31,4,64,0,0,1,1768,0.300,20,100

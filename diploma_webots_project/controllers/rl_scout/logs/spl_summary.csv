@@ -1,0 +1,5 @@
+set,n_traiectorii,succes_subset_%,succes_total_%,SPL,eficienta_drum_succes_%
+DQN — start random,20,90,64,0.831,92
+DQN — start centru,20,90,80,0.860,96
+DQN — hartă nevăzută,20,70,62,0.668,95
+Baseline reactiv,20,30,31,0.300,100

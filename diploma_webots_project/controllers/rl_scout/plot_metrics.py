@@ -163,7 +163,10 @@ def plot_eval_trajectories(tag="", title_mode="start random"):
         m = rx.match(os.path.basename(p))
         if m:
             matched.append((int(m.group(1)), p))
-    traj_files = [p for _, p in sorted(matched)]
+    # Desenăm doar primele 20 de trasee (lizibilitate): de la save_traj=100,
+    # toate episoadele au traiectorie pe disc (SPL le folosește pe toate), dar
+    # 100 de linii ar îneca figura. SPL (compute_spl) NU e plafonat.
+    traj_files = [p for _, p in sorted(matched)][:20]
     if not traj_files:
         if tag == "":
             print("[SKIP] Nu există traiectorii de evaluare (logs/eval_traj_*.csv).")
@@ -352,6 +355,193 @@ def plot_success_by_distance():
     print("[OK] Grafic succes-pe-distanță salvat (eval_success_by_distance.png).")
 
 
+def _path_length(rows):
+    """Lungimea drumului parcurs (suma segmentelor euclidiene între pașii
+    consecutivi ai traiectoriei)."""
+    p = 0.0
+    for a, b in zip(rows, rows[1:]):
+        p += math.hypot(float(b["x"]) - float(a["x"]), float(b["y"]) - float(a["y"]))
+    return p
+
+
+def compute_spl(tag=""):
+    """SPL — Success weighted by Path Length (Anderson et al., 2018), metrica
+    standard de eficiență a navigației:
+
+        SPL = (1/N) · Σ Sᵢ · lᵢ / max(pᵢ, lᵢ)
+
+    Sᵢ = 1 dacă episodul i a atins ținta (0 altfel), lᵢ = distanța optimă
+    start→goal, pᵢ = lungimea drumului efectiv parcurs. Spre deosebire de rata
+    de succes (binară), SPL penalizează ocolurile inutile → 1.0 = drum perfect
+    direct, valori mici = ajunge dar pe căi lungi/sinuoase.
+
+    lᵢ = distanța EUCLIDIANĂ start→goal, o limită INFERIOARĂ a drumului optim
+    care ocolește obstacolele; prin urmare SPL real ≥ valoarea raportată
+    (estimare conservatoare). pᵢ se calculează din traiectoria logată
+    (logs/eval_traj{tag}_*.csv), așa că metrica acoperă doar episoadele cu
+    traiectorie salvată (vezi `save_traj` în rl_scout.py). Întoarce un dict de
+    statistici sau None dacă lipsesc datele."""
+    summary_path = os.path.join(LOG_DIR, f"eval_summary{tag}.csv")
+    if not os.path.exists(summary_path):
+        return None
+    summary = _read_csv(summary_path)
+    if not summary:
+        return None
+    reason_by_run = {int(r["run"]): r["done_reason"] for r in summary}
+
+    rx = re.compile(rf"^eval_traj{re.escape(tag)}_(\d+)\.csv$")
+    traj = {}
+    for p in glob.glob(os.path.join(LOG_DIR, f"eval_traj{tag}_*.csv")):
+        m = rx.match(os.path.basename(p))
+        if m:
+            traj[int(m.group(1))] = p
+    if not traj:
+        return None
+
+    spls, effs = [], []
+    n_succ_subset = 0
+    for idx, path in sorted(traj.items()):
+        rows = _read_csv(path)
+        if len(rows) < 2:
+            continue
+        sx, sy = float(rows[0]["x"]), float(rows[0]["y"])
+        gx, gy = float(rows[-1]["goal_x"]), float(rows[-1]["goal_y"])
+        l = math.hypot(gx - sx, gy - sy)
+        p_len = _path_length(rows)
+        success = reason_by_run.get(idx) == "goal"
+        if success and l > 1e-6:
+            n_succ_subset += 1
+            effs.append(min(1.0, l / p_len) if p_len > 1e-6 else 0.0)
+            spls.append(l / max(p_len, l))
+        else:
+            spls.append(0.0)
+
+    if not spls:
+        return None
+    n_sub = len(spls)
+    full_succ = 100.0 * sum(1 for r in summary if r["done_reason"] == "goal") / len(summary)
+    return {
+        "tag": tag,
+        "n_traj": n_sub,
+        "n_full": len(summary),
+        "success_subset": 100.0 * n_succ_subset / n_sub,
+        "success_full": full_succ,
+        "spl": sum(spls) / n_sub,
+        "path_eff": (sum(effs) / len(effs)) if effs else 0.0,
+    }
+
+
+def plot_spl():
+    """Figură + tabel SPL pentru toate evaluările existente pe disc. Scrie
+    figures/eval_spl.png și logs/spl_summary.csv (tabelul din lucrare)."""
+    series = [("", "DQN — start random"),
+              ("_center", "DQN — start centru"),
+              ("_unseen", "DQN — hartă nevăzută"),
+              ("_baseline", "Baseline reactiv")]
+    rows = []
+    for tag, name in series:
+        d = compute_spl(tag)
+        if d:
+            rows.append((name, d))
+    if not rows:
+        print("[SKIP] SPL: lipsesc traiectoriile de evaluare (logs/eval_traj*_*.csv).")
+        return
+
+    # CSV pentru tabelul din lucrare (UTF-8: numele seriilor au diacritice/„—")
+    with open(os.path.join(LOG_DIR, "spl_summary.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["set", "n_traiectorii", "succes_subset_%", "succes_total_%",
+                    "SPL", "eficienta_drum_succes_%"])
+        for name, d in rows:
+            w.writerow([name, d["n_traj"], f"{d['success_subset']:.0f}",
+                        f"{d['success_full']:.0f}", f"{d['spl']:.3f}",
+                        f"{100 * d['path_eff']:.0f}"])
+
+    labels = [name for name, _ in rows]
+    spls = [d["spl"] for _, d in rows]
+    plt.figure(figsize=(8.5, 5))
+    plt.bar(range(len(rows)), spls,
+            color=["C0", "C1", "C2", "C3"][:len(rows)], alpha=0.85)
+    for i, (_, d) in enumerate(rows):
+        plt.text(i, d["spl"] + 0.012, f"{d['spl']:.3f}", ha="center", fontsize=10)
+    plt.xticks(range(len(rows)), labels, rotation=12)
+    plt.ylabel("SPL (Success weighted by Path Length)")
+    plt.ylim(0, max(0.1, max(spls)) * 1.20)
+    plt.title(f"Eficiența drumului (SPL)  ·  N={rows[0][1]['n_traj']} traiectorii/set")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, "eval_spl.png"), dpi=150)
+    plt.close()
+
+    print("[OK] SPL salvat (eval_spl.png, logs/spl_summary.csv):")
+    print(f"  {'set':22s} {'N':>3} {'succ_sub':>8} {'succ_tot':>8} {'SPL':>6} {'ef.drum':>8}")
+    for name, d in rows:
+        print(f"  {name:22s} {d['n_traj']:>3} {d['success_subset']:>7.0f}% "
+              f"{d['success_full']:>7.0f}% {d['spl']:>6.3f} {100 * d['path_eff']:>7.0f}%")
+
+
+def write_results_summary():
+    """Tabel consolidat (un singur CSV) cu toate metricile per set de evaluare:
+    ratele de done_reason, pașii medii la succes, SPL și eficiența drumului.
+    Sursă unică pentru tabelul de rezultate din lucrare → logs/results_summary.csv."""
+    series = [("", "DQN — start random"),
+              ("_center", "DQN — start centru"),
+              ("_unseen", "DQN — hartă nevăzută"),
+              ("_baseline", "Baseline reactiv")]
+    known = {"goal", "collision", "rollover", "out_of_bounds", "stuck"}
+
+    out_rows = []
+    for tag, name in series:
+        path = os.path.join(LOG_DIR, f"eval_summary{tag}.csv")
+        if not os.path.exists(path):
+            continue
+        rows = _read_csv(path)
+        if not rows:
+            continue
+        n = len(rows)
+
+        def rate(reason):
+            return 100.0 * sum(1 for r in rows if r["done_reason"] == reason) / n
+
+        timeout = 100.0 * sum(1 for r in rows if r["done_reason"] not in known) / n
+        goal_steps = [int(r["steps"]) for r in rows if r["done_reason"] == "goal"]
+        avg_steps = (sum(goal_steps) / len(goal_steps)) if goal_steps else 0.0
+        spl = compute_spl(tag)
+        out_rows.append({
+            "set": name, "N": n,
+            "succ": rate("goal"), "coll": rate("collision"), "stuck": rate("stuck"),
+            "roll": rate("rollover"), "oob": rate("out_of_bounds"), "to": timeout,
+            "steps": avg_steps,
+            "spl": spl["spl"] if spl else float("nan"),
+            "spl_n": spl["n_traj"] if spl else 0,
+            "eff": 100.0 * spl["path_eff"] if spl else float("nan"),
+        })
+
+    if not out_rows:
+        print("[SKIP] results_summary: lipsesc sumarele de evaluare.")
+        return
+
+    out = os.path.join(LOG_DIR, "results_summary.csv")
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["set", "N", "succes_%", "coliziune_%", "stuck_%", "rollover_%",
+                    "out_of_bounds_%", "timeout_%", "pasi_medii_goal", "SPL",
+                    "SPL_n_traiectorii", "eficienta_drum_%"])
+        for r in out_rows:
+            w.writerow([r["set"], r["N"], f"{r['succ']:.0f}", f"{r['coll']:.0f}",
+                        f"{r['stuck']:.0f}", f"{r['roll']:.0f}", f"{r['oob']:.0f}",
+                        f"{r['to']:.0f}", f"{r['steps']:.0f}", f"{r['spl']:.3f}",
+                        r["spl_n"], f"{r['eff']:.0f}"])
+
+    print(f"[OK] Tabel consolidat salvat ({out}):")
+    print(f"  {'set':22s} {'N':>3} {'succ':>5} {'coll':>5} {'stuck':>6} "
+          f"{'roll':>5} {'oob':>4} {'t/o':>4} {'pași':>6} {'SPL':>6} {'ef%':>4}")
+    for r in out_rows:
+        print(f"  {r['set']:22s} {r['N']:>3} {r['succ']:>4.0f}% {r['coll']:>4.0f}% "
+              f"{r['stuck']:>5.0f}% {r['roll']:>4.0f}% {r['oob']:>3.0f}% {r['to']:>3.0f}% "
+              f"{r['steps']:>6.0f} {r['spl']:>6.3f} {r['eff']:>3.0f}%")
+
+
 def main():
     os.makedirs(FIG_DIR, exist_ok=True)
     plot_training()
@@ -366,6 +556,8 @@ def main():
     plot_eval_summary(tag="_unseen", title_mode="hartă nevăzută")
     plot_comparison()
     plot_success_by_distance()
+    plot_spl()
+    write_results_summary()
     print("Gata. Verifică folderul figures/.")
 
 

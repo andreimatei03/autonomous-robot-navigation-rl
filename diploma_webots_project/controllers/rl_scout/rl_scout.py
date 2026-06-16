@@ -619,7 +619,7 @@ def run_evaluation():
     summary_file.close()
 
 
-def run_eval_batch(eval_n=EVAL_EPISODES, save_traj=20, random_start=True, tag="",
+def run_eval_batch(eval_n=EVAL_EPISODES, save_traj=100, random_start=True, tag="",
                    policy_fn=None, max_steps=MAX_STEPS):
     """Evaluare automată: N episoade cu goal random, fără intervenția
     utilizatorului. random_start=True → start random navigabil (ca la antrenare);
@@ -627,7 +627,10 @@ def run_eval_batch(eval_n=EVAL_EPISODES, save_traj=20, random_start=True, tag=""
     DQN (încarcă MODEL_BEST); altfel folosește funcția dată (ex. baseline-ul
     reactiv, pentru comparația DQN vs. reactiv din lucrare). Raportează rata
     de succes / pași / coliziuni / blocaje și scrie eval_summary{tag}.csv +
-    primele `save_traj` traiectorii (pentru grafice)."""
+    primele `save_traj` traiectorii (pentru grafice). save_traj=100 = TOATE
+    episoadele unei evaluări standard (cost de disc neglijabil) → metrica SPL
+    din plot_metrics.py se calculează pe întreaga populație, nu pe un subset;
+    figura de traiectorii rămâne lizibilă fiindcă desenează doar primele ~20."""
     mode_txt = "start random" if random_start else "start centru"
     policy_txt = "DQN" if policy_fn is None else "baseline reactiv"
     print("=" * 50)

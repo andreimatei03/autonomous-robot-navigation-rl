@@ -1,5 +1,6 @@
 import math
 import random
+from collections import deque
 
 import numpy as np
 
@@ -60,6 +61,22 @@ NON_OBSTACLE_DEFS = {"Pioneer3AT", "GOAL_TARGET", "TERRAIN"}
 # Numărul de sectoare LiDAR din starea RL (min-pooling uniform pe FOV-ul
 # orizontal de 180°; 12 × 15°). Folosit și de baseline-ul din rl_scout.py.
 N_LIDAR_SECTORS = 12
+
+# Raza LiDAR (m) — TREBUIE să fie egală cu `maxRange` din world.wbt /
+# world_eval.wbt. Toate trăsăturile LiDAR se normalizează la ea, iar pragurile
+# de proximitate/coliziune din reward sunt exprimate în METRI și împărțite la
+# ea → comportamentul lor e invariant la rază (la 10 m, identice cu pragurile
+# normalizate din run 5). Run 6 a încercat 20 m; ABLAȚIA (run 6+7) a arătat că
+# orizontul extins NU a ajutat și a destabilizat antrenarea → revenit la 10 m
+# (configurația run 5, headline-ul: 64/80/62).
+LIDAR_MAX_RANGE = 10.0
+
+# Frame stacking: starea RL = ultimele FRAME_STACK cadre concatenate, CEL MAI
+# RECENT PRIMUL (state[:frame_dim] = cadrul curent). FRAME_STACK=1 → un singur
+# cadru (configurația run 5). Run 6+7 au folosit 3 (memorie pe termen scurt):
+# ablația a arătat că a degradat politica (35/54 și 26/35 vs run 5 64/80) și,
+# cu rețeaua lărgită, a provocat divergența valorii (loss 6→1246) → revenit la 1.
+FRAME_STACK = 1
 NON_OBSTACLE_TYPES = {
     "TexturedBackground", "TexturedBackgroundLight", "Viewpoint",
     "WorldInfo", "Robot", "Pioneer3at", "DirectionalLight", "PointLight",
@@ -253,8 +270,14 @@ class ScoutEnv:
         self.last_state = None
         self.done_reason = None
 
-        self.state_dim = N_LIDAR_SECTORS + 11   # 12 sectoare + 3 profil vertical + 8 navigație/IMU
+        self.frame_dim = N_LIDAR_SECTORS + 11   # 12 sectoare + 3 profil vertical + 8 navigație/IMU
+        self.state_dim = self.frame_dim * FRAME_STACK   # FRAME_STACK=1 → 23 (run 5)
+        # 5 acțiuni (run 5): 0 fwd, 1/2 fwd-turn, 3/4 rotate. Reverse-ul DQN
+        # (acțiunea 5, run 6) a fost scos — ablația a arătat că a triplat stuck-ul
+        # (oscilație înainte/înapoi la obstacole); rămâne doar reverse-ul intern
+        # al baseline-ului (-1).
         self.action_dim = 5
+        self._frames = deque(maxlen=FRAME_STACK)
 
         # Goal-urile se plasează în poiană (boundary_r). Robotul, în schimb, e
         # mărginit de PĂDUREA tot mai deasă spre marginea hărții, impenetrabilă
@@ -542,7 +565,13 @@ class ScoutEnv:
 
         self.prev_distance, _ = self.world_to_robot_frame(self.goal_x, self.goal_y)
 
-        self.last_state = self._get_state()
+        # Frame stacking: la reset, istoricul se umple cu cadrul curent
+        # (nu există trecut → cele 3 cadre identice).
+        frame = self._get_state()
+        self._frames.clear()
+        for _ in range(FRAME_STACK):
+            self._frames.append(frame)
+        self.last_state = self._stack_frames()
         return self.last_state
 
     # ------------------------------------------------------------------
@@ -563,10 +592,14 @@ class ScoutEnv:
 
         self._update_odometry()
 
-        state = self._get_state()
+        # Reward-ul citește CADRUL BRUT curent (layout 23); politica primește
+        # starea stivuită (3 cadre, cel mai recent primul).
+        frame = self._get_state()
+        self._frames.append(frame)
+        state = self._stack_frames()
         self.last_state = state
         self.done_reason = None
-        reward, done = self._compute_reward(state)
+        reward, done = self._compute_reward(frame)
 
         if self.step_count >= self.max_steps:
             done = True
@@ -578,7 +611,8 @@ class ScoutEnv:
 
     def _apply_action(self, action):
         # 0 - forward, 1 - forward-left, 2 - forward-right,
-        # 3 - rotate left, 4 - rotate right, -1 - reverse scurt (baseline)
+        # 3 - rotate left, 4 - rotate right, -1 - reverse scurt (DOAR baseline;
+        # reverse-ul DQN a fost scos după ablația run 6/7, vezi action_dim).
         if action == -1:
             v_target, w_target = -0.25, 0.0
         elif action == 0:
@@ -680,7 +714,7 @@ class ScoutEnv:
 
     def _get_lidar_features(self):
         ranges = self.lidar.getRangeImage()
-        max_range = 10.0
+        max_range = LIDAR_MAX_RANGE
         n, layers = self._lidar_dimensions(ranges)
 
         # Construiește imaginea 2D (layers × n), curăță inf/nan, limitează.
@@ -723,6 +757,15 @@ class ScoutEnv:
         return sectors, upper_front, mid_front, height_profile
 
     # ------------------------------------------------------------------
+
+    def _stack_frames(self):
+        """Concatenează ultimele FRAME_STACK cadre, CEL MAI RECENT PRIMUL →
+        state[:frame_dim] = cadrul curent (layout-ul vechi rămâne valabil
+        pentru baseline și pentru orice consumator pe indici)."""
+        out = []
+        for f in reversed(self._frames):
+            out.extend(f)
+        return out
 
     def _get_state(self):
         sectors, upper_front, mid_front, height_profile = self._get_lidar_features()
@@ -799,14 +842,19 @@ class ScoutEnv:
         # apropiere netă de goal.
         reward -= abs(angle_norm) * 0.05
 
-        min_dist = min(sectors)
+        # Pragurile de proximitate sunt exprimate în METRI (sectoarele sunt
+        # normalizate la LIDAR_MAX_RANGE) → semnificația lor nu se schimbă
+        # când se modifică raza senzorului (run 6: 10 → 20 m).
+        front_m = front * LIDAR_MAX_RANGE
+        flank_m = flank * LIDAR_MAX_RANGE
+        min_dist_m = min(sectors) * LIDAR_MAX_RANGE
 
         # 3. Penalizări apropiere obstacol (din LiDAR)
-        if front < 0.10:
+        if front_m < 1.0:
             reward -= 1.0
-        if front < 0.05:
+        if front_m < 0.5:
             reward -= 2.0
-        if flank < 0.05:
+        if flank_m < 0.5:
             reward -= 0.1
 
         # 4. Penalizare instabilitate (descurajează pantele riscante)
@@ -817,11 +865,13 @@ class ScoutEnv:
         # reorientare legitimă de 90° durează ~30 pași → cost ~0.6, neglijabil)
         reward -= 0.0005
         reward -= abs(self.w) * 0.002
+        # Cost de staționare: penalizează statul pe loc/pivotarea prelungită
+        # (fără reverse DQN, v comandat e ≥0 → v real nu devine negativ).
         if self.v < 0.1:
             reward -= 0.02
 
-        # 6. Coliziune (LiDAR foarte aproape)
-        if min_dist < 0.025:
+        # 6. Coliziune (LiDAR foarte aproape — 0,25 m)
+        if min_dist_m < 0.25:
             self.done_reason = "collision"
             return -20.0, True
 

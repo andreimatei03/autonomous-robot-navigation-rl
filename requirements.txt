@@ -1,0 +1,14 @@
+# Dependențe Python pentru antrenare / evaluare / generare figuri (mediul rl_env).
+# Instalare:  python -m venv rl_env && rl_env\Scripts\activate && pip install -r requirements.txt
+# Testat cu Python 3.10.11 pe Windows 11.
+#
+# NOTĂ: bindingul Webots `controller` NU se instalează din pip — vine împreună
+# cu Webots R2025a și e adăugat automat în PYTHONPATH când lumea e deschisă din
+# simulator. tkinter face parte din biblioteca standard Python.
+#
+# Antrenarea rulează intenționat pe CPU (rețeaua e mică, Webots e
+# bottleneck-ul), deci wheel-ul CPU al PyTorch este suficient.
+
+torch==2.10.0
+numpy==1.26.4
+matplotlib==3.10.9

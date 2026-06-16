@@ -20,7 +20,19 @@ Thumbs.db
 .vscode/
 .idea/
 
+# .txt-urile de lucru/scratch rămân ignorate, DAR păstrăm requirements.txt
+# (reproductibilitatea mediului — altfel n-ar fi urmărit niciodată).
 *.txt
+!requirements.txt
 GitHub
 Upgrades
 STRUCTURA*
+
+# Documentele lucrarii (raman LOCALE — repo-ul e public, nu publicam
+# lucrarea/prezentarea/PDF-urile sau ciornele de capitole in markdown).
+*.docx
+*.doc
+*.pptx
+*.ppt
+*.pdf
+thesis_draft/

@@ -10,29 +10,37 @@ import torch.optim as optim
 # ==============================
 
 class QNetwork(nn.Module):
+    # Trunchi 128→128, streamuri →64 (configurația run 5, headline-ul). Run 7 a
+    # încercat 256/128 pentru starea stivuită de 69 dims: ABLAȚIA a arătat că
+    # rețeaua mai mare + bugetul lung au provocat divergența funcției de valoare
+    # (loss 6→1246, avg50 +622→−23) — rețeaua mică e robustă la deadly triad.
+    HIDDEN = 128
+    STREAM = 64
+
     def __init__(self, state_dim, action_dim):
         super(QNetwork, self).__init__()
+        h, s = self.HIDDEN, self.STREAM
 
         # Shared feature extraction
         self.shared = nn.Sequential(
-            nn.Linear(state_dim, 128),
+            nn.Linear(state_dim, h),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(h, h),
             nn.ReLU(),
         )
 
         # Value stream
         self.value_stream = nn.Sequential(
-            nn.Linear(128, 64),
+            nn.Linear(h, s),
             nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Linear(s, 1)
         )
 
         # Advantage stream
         self.advantage_stream = nn.Sequential(
-            nn.Linear(128, 64),
+            nn.Linear(h, s),
             nn.ReLU(),
-            nn.Linear(64, action_dim)
+            nn.Linear(s, action_dim)
         )
 
     def forward(self, x):
@@ -147,11 +155,11 @@ class DQNAgent:
 
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
 
-        # Set to eval mode for inference (batch norm needs this for single sample)
-        self.q_network.eval()
+        # Inferență sub no_grad. Rețeaua e doar Linear + ReLU (fără BatchNorm
+        # sau Dropout), deci modul train/eval nu schimbă ieșirea → nu comutăm
+        # aici; respectăm modul setat din afară (eval() la evaluare).
         with torch.no_grad():
             q_values = self.q_network(state_tensor)
-        self.q_network.train()
 
         return q_values.argmax().item()
 
