@@ -8,13 +8,16 @@ import numpy as np
 from collections import deque
 from controller import Supervisor
 from dqn_agent import DQNAgent
-from scout_env import ScoutEnv
+from scout_env import ScoutEnv, LIDAR_MAX_RANGE
 
 # ======================================================
 # CONFIG
 # ======================================================
 
-NUM_EPISODES   = 1200   # run 5+: stare nouă (12 sectoare) → puțin mai mult buget de învățare
+NUM_EPISODES   = 1200   # run 7: starea stivuită 69-dim + reteaua 256 au nevoie
+                        # de buget. Degradarea târzie (pathology #4, după ep~800)
+                        # nu afectează evaluarea — best-avg50 alege un checkpoint
+                        # din zona ~ep400-600.
 # 6500 × 32 ms = 208 s simulare: ținte la >60 m cu ocoliri nu mai pică
 # artificial în timeout (5000 = 160 s era chiar limita fizică pentru ~75 m
 # la ~0,5 m/s). Episoadele blocate tot le taie anti-stuck-ul la ~600 pași.
@@ -159,12 +162,15 @@ def select_baseline_action(state):
     # Webots e STÂNGA → DREAPTA („scan lines running from left to right",
     # manualul de referință Lidar) → indecșii MICI = stânga robotului.
     sectors = state[:12]
-    front = min(sectors[4:8])          # conul frontal ±30°
+    # Pragul frontal e în METRI (sectoarele sunt normalizate la
+    # LIDAR_MAX_RANGE) → comportamentul baseline-ului e INVARIANT la raza
+    # senzorului (1,2 m a fost și pragul evaluării de pe 12.06, rază 10 m).
+    front_m = min(sectors[4:8]) * LIDAR_MAX_RANGE   # conul frontal ±30°
     left_half = min(sectors[0:6])
     right_half = min(sectors[6:12])
     _, angle, _ = env.get_navigation_error()
 
-    if front < 0.12:
+    if front_m < 1.2:
         return 3 if left_half > right_half else 4
     if angle > 0.45:
         return 3
@@ -765,6 +771,183 @@ def run_baseline():
 
 
 # ======================================================
+# DEMO PREZENTARE — scenarii fixe, reproductibile (video / apărare)
+# ======================================================
+# Scenariile FIXE folosesc start/țintă din episoade reale de evaluare; cu
+# epsilon=0 (politică deterministă) și aceeași hartă, se reproduc → sigure.
+# Scenariul 3 pornește robotul lângă un CÂMP DENS de obstacole (9 obstacole,
+# caz real în care baseline-ul s-a blocat): controlerul reactiv intră în el și
+# se înțepenește indiferent de unghi (un singur obstacol l-ar fi ocolit — de
+# aceea contează un câmp dens, nu unul răzleț). Scenariul 4 arată DQN pe un
+# TRASEU COMPLEX (caz real din eval, traiectorie sinuoasă 1.31): pornind din
+# (38.4,-22.0) spre (22.3,8.3), 13 obstacole sunt pe linia directă, așa că
+# politica se umflă spre est ca să ocolească un câmp de obstacole, apoi arcuiește
+# spre țintă (deviație laterală ~13 m). theta=0.70 = direcția reală din rularea
+# reușită → reproduce fidel arcul. Împreună = contrastul reactiv-vs-învățat
+# (decuplat intenționat: câmpurile care opresc sigur baseline-ul sunt
+# impenetrabile și pentru DQN). Scenariul 5 e cu START RANDOM (distanță
+# medie-mare) cu re-roll [R] până prinzi o reușită bună de filmat.
+DEMO_SCENARIOS = [
+    {"label": "1) DQN - tinta medie (start centru, ~22 m)",
+     "policy": "dqn", "start": (0.0, 0.0), "goal": (15.8, 15.1)},
+    {"label": "2) DQN - tinta la distanta mare, cu ocoliri (~45 m)",
+     "policy": "dqn", "start": (0.0, 0.0), "goal": (-44.8, -7.0)},
+    {"label": "3) Baseline reactiv - se blocheaza in campul de obstacole",
+     "policy": "baseline", "start": (-37.6, -21.1), "goal": (21.2, 12.7)},
+    {"label": "4) DQN - traseu complex, ocoleste un camp de obstacole",
+     "policy": "dqn", "start": (38.4, -22.0), "goal": (22.3, 8.3), "theta": 0.70},
+    {"label": "5) DQN - start RANDOM, distanta medie-mare (~25-42 m)",
+     "policy": "dqn", "random": True, "dist_min": 25.0, "dist_max": 42.0},
+]
+
+_KEY_SPACE = ord(' ')
+_KEY_RETRY = (ord('r'), ord('R'))
+_KEY_QUIT = (ord('q'), ord('Q'), 27)   # Q sau ESC
+
+
+def _demo_pause(prompt, accept):
+    """Pășește simularea (robot oprit) și întoarce primul cod de tastă din
+    `accept` (sau din tastele de ieșire) apăsat → lasă prezentatorul să nareze.
+    Întoarce None dacă simularea s-a oprit."""
+    print(prompt)
+    for m in motors:
+        m.setVelocity(0.0)
+    wanted = set(accept) | set(_KEY_QUIT)
+    while env.simulation_running:
+        if robot.step(timestep) == -1:
+            env.simulation_running = False
+            return None
+        key = keyboard.getKey()
+        if key in wanted:
+            return key
+    return None
+
+
+def _demo_run_episode(policy, save_path):
+    """Rulează un episod (starea e deja resetată) cu politica dată; salvează
+    traiectoria. Întoarce (reached, reason, steps); reason='interrupt' dacă s-a
+    apăsat Q/ESC sau s-a oprit simularea."""
+    state = env.last_state
+    traj = []
+    while env.simulation_running:
+        action = (select_baseline_action(state) if policy == "baseline"
+                  else agent.select_action(state))
+        state, reward, done = env.step(action)
+        traj.append((env.step_count, env.x, env.y, env.goal_x, env.goal_y))
+        if keyboard.getKey() in _KEY_QUIT:       # ieșire de urgență în timpul rulării
+            for m in motors:
+                m.setVelocity(0.0)
+            return None, "interrupt", env.step_count
+        if done:
+            break
+    for m in motors:
+        m.setVelocity(0.0)
+    if not env.simulation_running:
+        return None, "interrupt", env.step_count
+
+    with open(save_path, "w", newline="") as tf:
+        tw = csv.writer(tf)
+        tw.writerow(["step", "x", "y", "goal_x", "goal_y"])
+        tw.writerows([(s, f"{x:.3f}", f"{y:.3f}", f"{a:.3f}", f"{b:.3f}")
+                      for (s, x, y, a, b) in traj])
+    return (env.done_reason == "goal"), (env.done_reason or "timeout"), env.step_count
+
+
+def _demo_verdict(reached, reason, steps):
+    verdict = "✓ ȚINTĂ ATINSĂ" if reached else f"✗ {reason}"
+    print(f"  → {verdict}  ({steps} pași ≈ {steps * env.dt:.0f}s sim)")
+
+
+def run_demo():
+    print("=" * 50)
+    print("  DEMO PREZENTARE — scenarii pentru video / comisie")
+    print("=" * 50)
+
+    if not os.path.exists(MODEL_BEST):
+        raise FileNotFoundError(f"Nu există {MODEL_BEST}. Rulează training întâi.")
+    try:
+        agent.q_network.load_state_dict(torch.load(MODEL_BEST))
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Modelul {MODEL_BEST} nu mai e compatibil cu starea "
+            f"({env.state_dim} valori). Antrenează de la zero."
+        ) from exc
+    agent.q_network.eval()
+    agent.epsilon = 0.0
+    env.max_steps = MAX_STEPS
+    _ensure_dirs()
+
+    print(f"✓ Model încărcat: {MODEL_BEST}")
+    print("  Comenzi:  SPACE = continuă/următorul   ·   R = altă pornire random (sc. 5)   ·   Q/ESC = ieșire")
+    print("  Sfat: click-dreapta pe robot → 'Follow Object' pentru cameră urmăritoare.")
+    print("  Pentru harta nevăzută: deschide worlds/world_eval.wbt și rulează din nou.\n")
+
+    if _demo_pause("  [SPACE] = începe demo-ul (pornește înregistrarea acum)",
+                   (_KEY_SPACE,)) not in (_KEY_SPACE,):
+        print("[DEMO] Anulat de utilizator.")
+        return
+
+    for idx, sc in enumerate(DEMO_SCENARIOS):
+        if not env.simulation_running:
+            break
+        policy = sc["policy"]
+
+        print("\n" + "-" * 50)
+        print(f"  {sc['label']}")
+        print("-" * 50)
+
+        if sc.get("random"):
+            # Start + țintă random, re-eșantionat până la distanța medie-mare;
+            # [R] reia cu altă pornire (până prinzi o reușită bună de filmat).
+            dmin, dmax = sc["dist_min"], sc["dist_max"]
+            while True:
+                for _ in range(40):
+                    env.reset(random_start=True, random_goal=True, goal_max_dist=dmax)
+                    dist = float(np.hypot(env.goal_x - env.x, env.goal_y - env.y))
+                    if dist >= dmin:
+                        break
+                print(f"  start=({env.x:.1f}, {env.y:.1f})  →  goal=({env.goal_x:.1f}, {env.goal_y:.1f})  d={dist:.1f} m  [DQN]")
+                reached, reason, steps = _demo_run_episode(
+                    "dqn", os.path.join(LOG_DIR, f"demo_{idx}_dqn_random.csv"))
+                if reason == "interrupt":
+                    print("[DEMO] Întrerupt.")
+                    return
+                _demo_verdict(reached, reason, steps)
+                key = _demo_pause("\n  [R] = altă pornire random   ·   [SPACE] = continuă   ·   [Q] = ieșire",
+                                  _KEY_RETRY + (_KEY_SPACE,))
+                if key in _KEY_QUIT or key is None:
+                    return
+                if key == _KEY_SPACE:
+                    break
+                # altfel R → reia bucla cu o nouă pornire random
+        else:
+            sx, sy = sc["start"]
+            gx, gy = sc["goal"]
+            theta = sc.get("theta")
+            if theta is None:
+                theta = float(np.arctan2(gy - sy, gx - sx))   # pornește cu fața spre țintă
+            print(f"  start=({sx:.1f}, {sy:.1f})  θ={theta:+.2f} rad  →  goal=({gx:.1f}, {gy:.1f})  [{policy.upper()}]")
+            env.set_goal(gx, gy)
+            env.reset(start_x=sx, start_y=sy, start_theta=theta, random_goal=False)
+            reached, reason, steps = _demo_run_episode(
+                policy, os.path.join(LOG_DIR, f"demo_{idx}_{policy}.csv"))
+            if reason == "interrupt":
+                print("[DEMO] Întrerupt.")
+                return
+            _demo_verdict(reached, reason, steps)
+            if idx < len(DEMO_SCENARIOS) - 1:
+                if _demo_pause("\n  [SPACE] = scenariul următor   ·   [Q] = ieșire",
+                               (_KEY_SPACE,)) not in (_KEY_SPACE,):
+                    break
+
+    for m in motors:
+        m.setVelocity(0.0)
+    print("\n" + "=" * 50)
+    print("  DEMO TERMINAT. Traiectorii salvate în logs/demo_*.csv")
+    print("=" * 50)
+
+
+# ======================================================
 # MAIN
 # ======================================================
 
@@ -853,6 +1036,9 @@ def ask_mode():
     add("Baseline reactiv — N episoade",
         "batch automat fără DQN → eval_summary_baseline.csv (figura DQN vs reactiv)",
         lambda: choose("baseline_batch"))
+    add("Demo prezentare (scenarii fixe)",
+        "4 scenarii reproductibile pt. video/comisie · SPACE = următorul",
+        lambda: choose("demo"), enabled=model_exists)
     add("Test rapid (50 episoade)",
         "antrenare scurtă de verificare",
         lambda: choose("train", episodes=QUICK_EPISODES))
@@ -885,6 +1071,8 @@ elif mode == "eval_batch_unseen":
 elif mode == "baseline_batch":
     run_eval_batch(cfg["eval_n"], random_start=True, tag="_baseline",
                    policy_fn=select_baseline_action, max_steps=cfg["max_steps"])
+elif mode == "demo":
+    run_demo()
 elif mode == "eval":
     run_evaluation()
 elif mode == "baseline":

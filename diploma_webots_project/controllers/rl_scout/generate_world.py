@@ -536,9 +536,12 @@ def robot_block():
 
 
 def goal_block():
-    # BEACON plutitor: nodul stă la sol (terrain_height), copiii plutesc → orb la
+    # BEACON plutitor: nodul stă la sol (terrain_height), orbul plutește la
     # înălțime CONSTANTĂ deasupra punctului, independent de teren (fără clipping
     # pe pante) și deasupra conului LiDAR (agentul tot navighează din stare).
+    # O SINGURĂ sferă emisivă roșie. PUR VIZUAL: fără boundingObject/physics →
+    # nicio coliziune, exclus și din scan_world_obstacles (NON_OBSTACLE_DEFS) →
+    # forma/culoarea NU intră în starea RL.
     gx, gy = 7.0, 0.0
     z = S.terrain_height(gx, gy)
     return (
@@ -546,17 +549,7 @@ def goal_block():
         f"  translation {gx:.3f} {gy:.3f} {z:.3f}\n"
         f"  rotation 0 0 1 0\n"
         f"  children [\n"
-        f"    Pose {{\n"                                    # rază subțire spre sol
-        f"      translation 0 0 0.60\n"
-        f"      rotation 1 0 0 1.5708\n"
-        f"      children [\n"
-        f"        Shape {{\n"
-        f"          appearance PBRAppearance {{ baseColor 1 0.2 0.15 emissiveColor 0.9 0.15 0.1 transparency 0.3 roughness 1 metalness 0 }}\n"
-        f"          geometry Cylinder {{ radius 0.03 height 1.10 }}\n"
-        f"        }}\n"
-        f"      ]\n"
-        f"    }}\n"
-        f"    Pose {{\n"                                    # orbul plutitor
+        f"    Pose {{\n"                                    # orbul plutitor (sferă emisivă roșie)
         f"      translation 0 0 1.20\n"
         f"      children [\n"
         f"        Shape {{\n"
